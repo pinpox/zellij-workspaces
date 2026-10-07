@@ -110,6 +110,23 @@ fn jj_workspace_add_info_remove_keeps_changes() {
 }
 
 #[test]
+fn jj_main_checkout_found_when_no_workspace_is_named_default() {
+    // Same failure as a main workspace without a recorded path (repos from
+    // older jj): `jj workspace root --name default` errors.
+    let sb = Sandbox::new("jj-renamed");
+    let main = sb.dir.join("proj");
+    sb.run("jj", &["git", "init", "proj"], &sb.dir);
+    sb.run("jj", &["workspace", "rename", "trunk"], &main);
+
+    let dir = sb.dir.join("proj.ws").join("feat");
+    let out = sb.ws(&["add", "jj", &s(&dir), "feat"], &main);
+    assert!(out.status.success(), "add: {}", stderr(&out));
+
+    assert_eq!(sb.info(&main), ["jj", &s(&main), &s(&main), "trunk"]);
+    assert_eq!(sb.info(&dir), ["jj", &s(&main), &s(&dir), "feat"]);
+}
+
+#[test]
 fn git_worktree_add_info_remove() {
     let sb = Sandbox::new("git");
     let main = sb.dir.join("proj");

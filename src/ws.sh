@@ -19,7 +19,17 @@ shift 2
 case $cmd in
 info)
   if root=$(jj workspace root --ignore-working-copy 2>/dev/null); then
-    main=$(jj workspace root --ignore-working-copy --name default 2>/dev/null) || main=$root
+    # The main checkout holds the repo store in .jj/repo; other workspaces
+    # have a file there pointing at it (relative to their .jj). Not using
+    # `jj workspace root --name default`: it fails when the main workspace
+    # is renamed or its path was never recorded (repos from older jj).
+    if [ -f "$root/.jj/repo" ]; then
+      store=$(cat "$root/.jj/repo")
+      case $store in /*) ;; *) store=$root/.jj/$store ;; esac
+      main=$(cd "$store/../.." && pwd -P)
+    else
+      main=$root
+    fi
     name=$(jj workspace list --ignore-working-copy -T 'name ++ "\t" ++ root ++ "\n"' |
       awk -F '\t' -v r="$root" '$2 == r { print $1; exit }')
     printf 'jj\t%s\t%s\t%s\n' "$main" "$root" "${name:-default}"
