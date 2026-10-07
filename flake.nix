@@ -40,7 +40,11 @@
             pname = "zellij-workspaces";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # zellij-tile comes from a pinned zellij git revision (see Cargo.toml)
+              allowBuiltinFetchGit = true;
+            };
             # zellij-tile's host-target deps (used by `cargo test`) link openssl
             nativeBuildInputs = [ pkgs.pkg-config ];
             buildInputs = [ pkgs.openssl ];
