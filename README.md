@@ -32,8 +32,8 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
 - **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
   `zellij pipe`, e.g. from Claude Code hooks.
 
-Forked from [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs) (MIT), which
-provides the grouped sidebar, status icons and state persistence.
+Built on [zellij-vtabs](https://github.com/otezz/zellij-vtabs) by Seto Kuslaksono, see
+[Credits](#credits).
 
 ## Requirements
 
@@ -189,6 +189,25 @@ zellij action start-or-reload-plugin file:target/wasm32-wasip1/release/zellij-wo
 
 `nix build` runs the same tests.
 
+## Credits
+
+This is a fork of [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs) by Seto
+Kuslaksono, and most of the plugin is that work. From zellij-vtabs:
+
+- the vertical sidebar: grouping tabs by `group:label`, collapsing, reordering, inline
+  renaming, mouse and keyboard navigation, overflow-safe rendering
+- per-session persistence of group order, tab order and collapse state shared across
+  the per-tab plugin instances
+- agent status icons encoded in tab names, their pipe interface, the spinner and its
+  preview page, and the Claude Code hook script (`shell/agent-status.sh`, formerly
+  `vtabs-work.sh`)
+- the design notes on why state has to live in tab names and the cache directory
+
+Added in this fork: workspace-based tab naming from cwd events, the create/remove
+dialogs and their self-registered keybindings, `ws.sh` with its jj/git tests, and the
+Nix flake. The cwd-pipe auto-grouping and the shell worktree helpers of zellij-vtabs
+were replaced by these.
+
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE). The original copyright notice of zellij-vtabs is kept there.
