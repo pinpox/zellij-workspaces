@@ -13,16 +13,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip1
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked
-      - run: cargo clippy --locked --release --target wasm32-wasip1 -- -D warnings
-      - run: cargo build --locked --release --target wasm32-wasip1
+      # the flake provides rust with wasm32-wasip1 plus the jj/git the tests drive
+      - uses: cachix/install-nix-action@v31
+      - run: nix build -L # cargo test + wasm build
+      - run: nix develop -c cargo clippy --locked --release --target wasm32-wasip1 -- -D warnings
       # attaches the wasm to the release for this tag (creates the release if
       # it doesn't exist yet — notes can be edited afterwards)
       - uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: target/wasm32-wasip1/release/zellij-vtabs.wasm
+          files: result/share/zellij/plugins/zellij-workspaces.wasm

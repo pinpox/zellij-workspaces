@@ -1,13 +1,16 @@
 [package]
-name = "zellij-vtabs"
-version = "0.2.3"
+name = "zellij-workspaces"
+version = "0.3.0"
 edition = "2021"
-description = "Zellij vertical sidebar: grouped tabs with collapse/expand"
+description = "Zellij sidebar: tabs grouped by project, with jj workspace / git worktree management"
 license = "MIT"
 
 [dependencies]
 zellij-tile = "=0.44.2"
-glob-match = "0.2"
+
+[dev-dependencies]
+# parse generated keybinding KDL with zellij's own config parser
+zellij-utils = "=0.44.2"
 
 [profile.release]
 opt-level = "s"

@@ -1,0 +1,20 @@
+// workspaces.kdl: zellij-workspaces sidebar + default status bar
+// Usage: zellij --layout workspaces  (or `default_layout "workspaces"` in config.kdl)
+// New tabs copy this layout, so every tab gets the sidebar.
+
+layout {
+    pane split_direction="vertical" {
+        pane size=28 borderless=true {
+            plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
+                // new_key "Alt w"    // create a workspace for the focused pane's repo ("" disables)
+                // close_key "Alt W"  // remove the focused tab's workspace ("" disables)
+                // separator ":"      // tab names are project<separator>workspace
+            }
+        }
+        pane // main terminal area
+    }
+    // single-line key-hint bar, exactly matching the built-in default layout
+    pane size=1 borderless=true {
+        plugin location="zellij:status-bar"
+    }
+}

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>zellij-vtabs · spinner preview</title>
+<title>zellij-workspaces · spinner preview</title>
 <style>
   :root {
     --bg: #f2f4f5;
@@ -131,7 +131,7 @@
 </head>
 <body>
 <main>
-  <p class="crumb"><a href="./">← zellij-vtabs</a> / spinner preview</p>
+  <p class="crumb">zellij-workspaces / spinner preview</p>
   <h1>spinner preview</h1>
   <p class="sub">Pick the animation for the working indicator. Each card is a mock of the
   sidebar: the spinner runs between a <span style="color:var(--yellow)">◆ waiting</span>
@@ -155,7 +155,7 @@
     <h2>Use your pick</h2>
     <p>Copy a card's frames and set them in the layout's plugin config — each character is
     one animation frame (the default is <code>dots-dense</code>):</p>
-    <pre class="snippet">plugin location="file:~/.config/zellij/plugins/zellij-vtabs.wasm" {
+    <pre class="snippet">plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
     spinner "⣾⣽⣻⢿⡿⣟⣯⣷"
 }</pre>
     <p>Layout config is read at plugin load, so start a fresh session to see it.</p>

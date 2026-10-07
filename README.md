@@ -1,324 +1,194 @@
-# zellij-vtabs
+# zellij-workspaces
 
-A vertical, grouped, collapsible tab sidebar for [Zellij](https://zellij.dev) — with attention indicators driven by Claude Code.
+A [Zellij](https://zellij.dev) sidebar that groups tabs by project and manages
+[jj workspaces](https://jj-vcs.github.io/jj/latest/working-copy/#workspaces) and
+git worktrees, one tab per workspace.
 
-> ⚠️ **This is a personal tool, built for my own setup — not a general-purpose plugin.**
-> It hardcodes assumptions about *my* workflow: my plugin path, my `:`-based tab-naming
-> convention, my Zellij version, my Claude Code hooks. It is published for my own reuse
-> across machines, not as something meant to work out-of-the-box for anyone else. There
-> are no stability guarantees, no issue tracker, and no intention to generalize it. If you
-> stumbled on this: feel free to read/fork, but expect to change paths and conventions to
-> fit your own environment.
+```
+ ▼ proj (2)
+     default
+   ● feat-x
+ ▼ other (1)
+     main
+```
 
-## What it does
+Everything lives in the plugin: no shell hooks, scripts or keybindings in your config.
 
-Zellij has no native vertical tabs. This plugin renders a left sidebar showing tabs as a
-**collapsible tree grouped by name prefix**, so I can keep many tabs organized at a glance:
+- **Tabs named after their workspace.** When a shell changes directory, the tab is
+  renamed `project:workspace`: the project is the main checkout's directory name, the
+  workspace is the jj workspace name, or for git the worktree directory (`main` for
+  the main worktree). Tabs whose shell starts in a repository are named on creation.
+  Directories outside a repository leave the name alone.
+- **Grouped, collapsible sidebar.** `group:label` tabs are shown under `group`; other
+  tabs land in **General**. Groups and tabs can be reordered, collapsed and renamed.
+- **`Alt w`: new workspace** for the focused pane's repository. Asks for a name,
+  creates it next to the main checkout in `<project>.ws/<name>` (jj: `jj workspace
+  add`; git: `git worktree add`, new branch `<name>` unless it exists, `/` in the name
+  becomes `-` in the directory) and opens it in a new tab.
+- **`Alt W`: remove the focused tab's workspace** after a `y` confirmation and close the
+  tab. jj: the workspace is snapshotted and forgotten, its changes stay in the repo, the
+  directory is deleted. git: `git worktree remove`, which refuses if the worktree has
+  changes. The main checkout is never removed.
+- **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
+  `zellij pipe`, e.g. from Claude Code hooks.
 
-![zellij-vtabs sidebar](docs/screenshot.png)
-
-Groups (`▼`/`▶`) collapse and expand; `◆` (yellow) marks a tab needing input, `✓` (green) a
-finished one, and `●` marks the active tab.
-
-- **Grouping** — a tab named `group:label` goes under group **group** with label **label**;
-  a tab with no `:` lands in **General**. (First `:` wins.)
-- **Collapse / expand** groups (`▶`/`▼`).
-- **Reorder groups and tabs** — `Shift+J`/`Shift+K` (or `Shift+↓`/`Shift+↑`) move the
-  selected row: a group header moves the whole group, a tab moves within its group. Tab
-  moves are *virtual* (display-order only — the plugin API can't move real tabs): a group
-  follows Zellij's native tab positions until you explicitly reorder in it, after which the
-  saved order wins for that group.
-- **Persistent state** — group order, tab order, and collapse state survive session
-  restarts and stay in sync across every tab's sidebar (stored per session in the plugin's
-  cache dir).
-- **Rename inline** — `r` opens an inline editor (`Enter` commits, `Esc` cancels): on a
-  group header it renames the group (every member tab is re-prefixed, saved state
-  follows); on a tab row it renames the tab's label, keeping its group.
-- **Auto-grouping (opt-in)** — a small shell script pipes each pane's starting directory
-  (+ git facts) to the plugin, which auto-names still-default tabs (`repo:branch`,
-  `repo:worktree`, …) by configurable rules. Manual names always win. See below.
-- **Navigate** with `j`/`k`/arrows, `Enter`/`Space` to switch tab or toggle a group.
-- **Mouse**: left-click to switch/toggle, scroll to move the selection.
-- **Active tab** marked with `●`; the selection highlight follows it.
-- **Attention icons** — `◆` (yellow, needs input) and `✓` (green, done), appearing on the
-  tab and **rolling up to a collapsed group's header**. Cleared automatically when I focus
-  the tab. Wired to Claude Code's `Notification`/`Stop` hooks.
-- **Working spinner** — an animated cyan spinner while Claude is running in a tab (wired
-  to the `UserPromptSubmit` hook). Unlike the attention icons it shows on the active tab
-  too and is *not* cleared by focusing — it ends when Claude needs input, finishes, or
-  exits (`SessionEnd`). Rolls up to collapsed group headers (waiting > working > done).
+Forked from [otezz/zellij-vtabs](https://github.com/otezz/zellij-vtabs) (MIT), which
+provides the grouped sidebar, status icons and state persistence.
 
 ## Requirements
 
-- **Zellij ≥ the `zellij-tile` version the wasm was built with** — release builds use
-  `0.44.2`, and the prebuilt wasm is verified working on Zellij **0.43.1, 0.44.2, and
-  0.44.3** (the protobuf plugin API tolerates version skew in both directions better than
-  Zellij's error messages suggest; a plugin built against a *newer* `zellij-tile` than the
-  running Zellij is the combination that reliably fails).
-- **Building from source:** Rust + `cargo` with the `wasm32-wasip1` target
-  (`rustup target add wasm32-wasip1`), and keep the `zellij-tile` pin **at or below** your
-  Zellij version — don't use a caret/range requirement, Cargo resolves those upward.
+- Zellij 0.44.2 or newer (the plugin is built against `zellij-tile` 0.44.2; builds
+  against an older `zellij-tile` load on newer Zellij, not the other way round)
+- `sh` and `jj` and/or `git` on the `PATH` of the Zellij server
 
-## Quick try (zero install)
+## Install
 
-Zellij can load the plugin straight from the release URL — no download, no Rust. Save
-this as `try-vtabs.kdl`:
+With Nix:
 
-```kdl
-layout {
-    pane split_direction="vertical" {
-        pane size=28 borderless=true {
-            plugin location="https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm"
-        }
-        pane
-    }
-    pane size=1 borderless=true {
-        plugin location="zellij:status-bar"
-    }
-}
+```sh
+nix build github:pinpox/zellij-workspaces
+# result/share/zellij/plugins/zellij-workspaces.wasm
 ```
 
-Pre-seed the permissions in `~/.cache/zellij/permissions.kdl` (the in-pane grant prompt
-doesn't render usably in a 28-column sidebar):
+From source (needs the `wasm32-wasip1` Rust target; `nix develop` provides it):
 
-```kdl
-"https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm" {
-    ReadApplicationState
-    ChangeApplicationState
-    ReadCliPipes
-}
-```
-
-Then: `zellij --new-session-with-layout ./try-vtabs.kdl`. Zellij caches the download, so
-this also survives offline use. Name a couple of tabs `group:label` and you have the tree.
-
-## Build & install
-
-```bash
+```sh
 cargo build --release --target wasm32-wasip1
-cp target/wasm32-wasip1/release/zellij-vtabs.wasm ~/.config/zellij/plugins/zellij-vtabs.wasm
+cp target/wasm32-wasip1/release/zellij-workspaces.wasm ~/.config/zellij/plugins/
 ```
 
-Or skip the Rust toolchain and grab the prebuilt `zellij-vtabs.wasm` from the
-[latest release](https://github.com/otezz/zellij-vtabs/releases/latest):
+Add the sidebar to your layout. [`layouts/workspaces.kdl`](layouts/workspaces.kdl) is a
+complete one; copy it to `~/.config/zellij/layouts/` and set
+`default_layout "workspaces"` in `config.kdl`. New tabs copy the layout, so every tab
+gets the sidebar. Use a plain base layout as in that file: with `default_tab_template`
+the first tab ends up without a terminal pane.
 
-```bash
-curl -Lo ~/.config/zellij/plugins/zellij-vtabs.wasm \
-  https://github.com/otezz/zellij-vtabs/releases/latest/download/zellij-vtabs.wasm
-```
+### Permissions
 
-Pre-seed the plugin's permissions (Zellij's in-pane grant prompt doesn't render usably in a
-narrow sidebar), in `~/.cache/zellij/permissions.kdl`. Note Zellij keys this by the **resolved
-absolute** path, so use your real home dir here (not `~`):
+On first start Zellij asks to grant `ReadApplicationState`, `ChangeApplicationState`,
+`ReadCliPipes`, `RunCommands` and `Reconfigure`. The prompt is cramped in a narrow
+sidebar; you can pre-grant instead in `~/.cache/zellij/permissions.kdl`, keyed by the
+plugin's absolute path:
 
 ```kdl
-"/home/<you>/.config/zellij/plugins/zellij-vtabs.wasm" {
+"/home/you/.config/zellij/plugins/zellij-workspaces.wasm" {
     ReadApplicationState
     ChangeApplicationState
     ReadCliPipes
+    RunCommands
+    Reconfigure
 }
 ```
 
-Use the layout in `layouts/vtabs.kdl` (also copied to `~/.config/zellij/layouts/vtabs.kdl`),
-and set it as the default in `~/.config/zellij/config.kdl`:
+`RunCommands` runs jj/git; `Reconfigure` registers the two keybindings in memory (your
+config file is not written).
+
+## Configuration
+
+In the layout's `plugin` block (defaults shown):
 
 ```kdl
-default_layout "vtabs"
+plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
+    new_key "Alt w"        // "" disables
+    close_key "Alt W"      // "" disables
+    separator ":"          // project<separator>workspace
+    waiting_icon "◆"       // rendered yellow
+    completed_icon "✓"     // rendered green
+    spinner "⣾⣽⣻⢿⡿⣟⣯⣷"    // working animation, one width-1 char per frame
+}
 ```
 
-Fast dev loop (code-only changes — layout/config changes still need a fresh session):
+Pick spinner frames on the [preview page](docs/spinner.html).
 
-```bash
-cargo build --release --target wasm32-wasip1 \
-  && cp target/wasm32-wasip1/release/zellij-vtabs.wasm ~/.config/zellij/plugins/zellij-vtabs.wasm
-zellij action start-or-reload-plugin file:~/.config/zellij/plugins/zellij-vtabs.wasm
-```
+## Sidebar keys and mouse
 
-## Claude Code integration
+Focus the sidebar pane, then:
 
-The attention icons and working spinner are driven by Claude Code hooks. Rather than each
-hook piping a fixed signal, they call `shell/vtabs-work.sh` with an event name; the script
-keeps a per-pane count of the main-agent turn plus outstanding subagents and derives the
-right signal — so the spinner stays lit for the *whole* task, not just the main agent's
-first turn. Install it and wire the hooks:
+| Key | Action |
+|---|---|
+| `j`/`k`, arrows | move the selection |
+| `Enter`/`Space` | switch to the tab, or collapse/expand the group |
+| `Shift+J`/`Shift+K`, `Shift+↓`/`Shift+↑` | move the group, or the tab within its group |
+| `r` | rename the group (re-prefixes its tabs) or the tab's label |
 
-```bash
-cp shell/vtabs-work.sh ~/.config/zellij/vtabs-work.sh && chmod +x ~/.config/zellij/vtabs-work.sh
-```
+Left click switches or toggles, the scroll wheel moves the selection. Tab moves only
+change the sidebar's order; group order, tab order and collapse state persist per
+session.
+
+## Agent status
+
+Send `zellij pipe --name "zellij-workspaces::<signal>::<pane_id>"` with `<signal>` one of
+`waiting`, `completed`, `working`, `clear-working`; the tab containing the pane gets the
+status. `waiting`/`completed` are never set on the tab you are looking at and are
+cleared when you switch to it; `working` stays until `waiting`, `completed` or
+`clear-working` arrives.
+
+The status is stored as a suffix on the tab name (` ⏳`, ` ✅`, ` ⚙`), the only state all
+per-tab plugin instances see alike. Workspace renames keep it.
+
+[`shell/agent-status.sh`](shell/agent-status.sh) drives this from Claude Code hooks,
+counting subagents so the spinner stays on until the whole task is done, and plays a
+freedesktop sound when a task finishes or needs input:
 
 ```json
 {
   "hooks": {
     "UserPromptSubmit": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh prompt >/dev/null 2>&1 &)" }] }],
+      "command": "(~/.config/zellij/agent-status.sh prompt >/dev/null 2>&1 &)" }] }],
     "SubagentStart": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh subagent-start >/dev/null 2>&1 &)" }] }],
+      "command": "(~/.config/zellij/agent-status.sh subagent-start >/dev/null 2>&1 &)" }] }],
     "SubagentStop": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh subagent-stop >/dev/null 2>&1 &)" }] }],
+      "command": "(~/.config/zellij/agent-status.sh subagent-stop >/dev/null 2>&1 &)" }] }],
     "Notification": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh notify >/dev/null 2>&1 &)" }] }],
+      "command": "(~/.config/zellij/agent-status.sh notify >/dev/null 2>&1 &)" }] }],
     "Stop": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh stop >/dev/null 2>&1 &)" }] }],
+      "command": "(~/.config/zellij/agent-status.sh stop >/dev/null 2>&1 &)" }] }],
     "SessionEnd": [{ "hooks": [{ "type": "command", "timeout": 3,
-      "command": "(~/.config/zellij/vtabs-work.sh end >/dev/null 2>&1 &)" }] }]
+      "command": "(~/.config/zellij/agent-status.sh end >/dev/null 2>&1 &)" }] }]
   }
 }
 ```
 
-- `UserPromptSubmit` (new turn) → start fresh, animated spinner on that tab
-- `SubagentStart` / `SubagentStop` → adjust the outstanding-subagent count (spinner stays lit)
-- `Notification` (needs input) → `◆` on that tab
-- `Stop` (main-agent turn ended) → `✓` **only if no subagents are still outstanding**,
-  otherwise the spinner keeps running — this is the whole reason for the counter: `Stop`
-  fires once per *main-agent* turn, so without it the spinner would clear while background
-  subagents are still working
-- `SessionEnd` (Claude exits) → clears any leftover spinner and the pane's count
-- Focusing the tab clears `◆`/`✓`; the spinner survives focus and ends via the hooks above
+The script pipes with `< /dev/null` (otherwise `zellij pipe` reads the hook's stdin and
+hangs) and `timeout 3` (no listening plugin, e.g. a session without this layout).
 
-The script also plays a freedesktop sound on exactly those two real events — `complete`
-when the whole task finishes and `message-new-instant` when it needs input — gated by the
-same counter, so you get one chime per task rather than one per main-agent turn or subagent.
-It falls back `canberra-gtk-play` → `pw-play` → silent, so it's a no-op where neither exists.
-Delete the `sound=` / playback lines in `vtabs-work.sh` to turn it off.
+## Limitations
 
-Why the script (rather than a fixed pipe per hook, and why a shell counter rather than one
-in the plugin): the plugin runs one instance per tab and pipe delivery across instances
-isn't reliable, so a counter in plugin memory would diverge — the shell gives one per-pane
-state file guarded by `flock`. Inside the script every `zellij pipe` still uses
-`< /dev/null` (without it the pipe reads Claude's hook stdin until EOF and deadlocks) and
-`timeout 3` (which actually kills the pipe when no plugin is listening — a session without
-this layout — since the hook-level `"timeout"` only stops Claude *waiting*). The `( … & )`
-subshell makes each hook return instantly. (Shell backgrounding is fine; Claude Code's
-`async: true` hook property is not — async hooks failed to deliver pipes reliably in testing.)
+- **Repositories under `/tmp`, `/data`, `/cache` or `/host`:** Zellij maps these
+  prefixes to plugin sandbox directories when a plugin opens a tab, so a new workspace
+  tab there opens in the wrong directory. jj/git commands are unaffected.
+- **Manual tab names are overwritten** on the next directory change inside a repository.
+- **One plugin instance per tab:** every instance receives every event. Only the
+  instance in a pane's own tab reacts to its directory changes, and status changes are
+  idempotent renames, so nothing runs twice.
 
-Manual test — note it must target a **non-active** tab (the plugin never marks the tab you're
-currently on, by design):
+## How it works
 
-```bash
-# on tab B:
-echo $ZELLIJ_PANE_ID        # e.g. 3
-# switch to another tab, then:
-zellij pipe --name "zellij-vtabs::waiting::3"
+- **Sidebar instances** react to `CwdChanged` and probe new default-named tabs with
+  `get_pane_cwd`. They run [`src/ws.sh`](src/ws.sh), embedded in the plugin, through
+  `run_command` to ask jj/git which workspace a directory belongs to, then rename the
+  tab with `rename_tab_with_id`.
+- **The keybindings** are added with `reconfigure` as `LaunchPlugin` actions that start
+  a floating instance of the same plugin with `mode "new"` or `mode "close"`. Zellij
+  starts such a plugin in the focused pane's directory, which tells the dialog which
+  repository it is about.
+- **The dialog instance** runs `ws.sh add`/`remove`, then calls `new_tab` or
+  `close_tab_with_id` and closes itself.
+- **`ws.sh` runs from `/`** with the repository directory as an argument, because Zellij
+  rewrites a command cwd under `/tmp` etc. (see Limitations).
+
+## Development
+
+```sh
+nix develop            # rust with wasm32-wasip1, jj, git
+cargo test             # unit tests + ws.sh against real jj/git repos
+cargo clippy --release --target wasm32-wasip1 -- -D warnings
+cargo build --release --target wasm32-wasip1
+zellij action start-or-reload-plugin file:target/wasm32-wasip1/release/zellij-workspaces.wasm
 ```
 
-## Auto-grouping (opt-in)
+`nix build` runs the same tests.
 
-The plugin can name default-named (`Tab #N`) tabs from each pane's starting directory.
-Plugins can't see pane cwds (WASI sandbox), so a small script pipes the facts in:
+## License
 
-```bash
-cp shell/vtabs-rename.sh ~/.config/zellij/vtabs-rename.sh
-chmod +x ~/.config/zellij/vtabs-rename.sh
-```
-
-Run it once per shell start — e.g. in `~/.zshrc`:
-
-```zsh
-(~/.config/zellij/vtabs-rename.sh &) 2>/dev/null
-```
-
-Then enable it in the layout's `plugin` block:
-
-```kdl
-autogroup_default "repo"                      // repo | dir | off (default: off)
-autogroup_1 "/mnt/d/codes/work/** -> work"    // optional cwd-glob overrides, tried in order
-```
-
-- `repo` — group = the owning git repo's name, worktree-aware: a pane in a linked worktree
-  gets `repo:worktree-dir`; at the repo root the label is the branch; in a subdir, the dir
-  name. Non-repo dirs are left alone.
-- `dir` — plain `basename $cwd` (lands in **General**) when no rule matches.
-- Only tabs still named `Tab #N` are renamed — name a tab manually and it stays yours.
-
-### Claude Code worktrees
-
-To have `claude -w fix-auth` label its tab with the worktree name (`repo:fix-auth`), add a
-`SessionStart` hook — `force` mode deliberately overrides the tab's current name:
-
-```json
-"SessionStart": [{ "hooks": [{ "type": "command", "timeout": 5,
-  "command": "(~/.config/zellij/vtabs-rename.sh force >/dev/null 2>&1 &)" }] }]
-```
-
-### Worktree launcher
-
-`claude -w` names the worktree for you. To create one with **your own name**, in a new tab
-grouped under the repo and already running Claude, use the `nw` / `rw` shell functions:
-
-```bash
-cp shell/vtabs-worktree.zsh ~/.config/zellij/vtabs-worktree.zsh
-cp layouts/vtabs-claude.kdl ~/.config/zellij/layouts/vtabs-claude.kdl   # a vtabs layout whose main pane runs `claude`
-# in ~/.zshrc:
-source ~/.config/zellij/vtabs-worktree.zsh
-```
-
-- `nw fix-auth` → worktree at `<repo>/.claude/worktrees/fix-auth` on a new branch `fix-auth`,
-  opened in a new tab named `<repo>:fix-auth` (so it lands in the repo's group) running Claude.
-  `nw fix-auth main` branches off `main`. Run it from anywhere inside the repo.
-- `rw` (from inside a worktree tab) removes that worktree and closes the tab; `rw -f` forces
-  past uncommitted changes. It refuses to touch the main worktree.
-
-## Configuration
-
-Optional plugin config in the layout's `plugin` block (defaults shown):
-
-```kdl
-plugin location="file:~/.config/zellij/plugins/zellij-vtabs.wasm" {
-    separator ":"          // tab-name group separator
-    waiting_icon "◆"       // rendered yellow
-    completed_icon "✓"     // rendered green
-    spinner "⣾⣽⣻⢿⡿⣟⣯⣷"    // working animation: each char = one frame
-    // plus the autogroup_* keys described above
-}
-```
-
-### Spinner
-
-![working spinner](docs/spinner.svg)
-
-Compare animation candidates on the **[live preview page](https://otezz.github.io/zellij-vtabs/spinner.html)**
-(every set spinning inside a mock sidebar row), copy the frames you like, and set them via
-the `spinner` config key. Width-1 glyphs only — emoji frames are double-width and break
-the sidebar's column math.
-
-## Architecture notes (why it's built this way)
-
-The one non-obvious design decision, learned the hard way:
-
-**Zellij spawns one plugin instance per tab, and per-instance mutable state always diverges** —
-broadcast CLI pipes and `pipe_message_to_plugin` don't reliably fan out to every instance, and
-`Event::Visible` / `PaneUpdate.is_focused` aren't usable signals here (`is_focused` came through
-as `None`). The *only* state every instance reads identically is the **tab name** (via
-`TabUpdate`). So attention is encoded as a name suffix (` ⏳`/` ✅`) applied with `rename_tab`
-(a global mutation), then parsed back out for display.
-
-The working model, which avoids any set/clear race:
-
-- **Set** marks a tab *only if it isn't the active tab* (you don't need a cue for what you're
-  looking at).
-- **Clear** strips the marker from the active tab on every `TabUpdate` (switching to a tab makes
-  it active → it's "seen" → cleared).
-
-Group order and collapse state follow the same "only global state survives" rule: they live
-in a small file under the plugin's `/cache` mount (host side:
-`~/.cache/zellij/<plugin-location>/plugin_cache/`), which Zellij keys by plugin *location* —
-so every per-tab instance reads the same file. One file **per session** (named from
-`ModeUpdate`'s `session_name`), because a single shared file would let each session's save
-wipe the others' groups. Instances re-read the file on every `TabUpdate`, and only the
-focused (visible) instance ever writes, so the sidebar you're looking at is always fresh.
-
-Two build gotchas on modern Rust + Zellij:
-
-1. **Pin `zellij-tile` exactly, at or below the oldest Zellij you target** (`= 0.44.2`). A
-   caret range grabs the newest patch, and a plugin built against a newer `zellij-tile`
-   than the running Zellij fails to load (`could not find exported function`). The reverse
-   direction is fine — an older-tile build runs on newer Zellij.
-2. **Build as a binary crate, not `cdylib`.** On current Rust, a `cdylib` for `wasm32-wasip1`
-   emits a WASI *reactor* (no `_start`); Zellij needs a *command* (`_start`). A bin crate lets
-   `register_plugin!`'s own `main` become `_start`. (Don't add your own `fn main` — the macro
-   defines one.)
-
-## Layout / status bar
-
-`layouts/vtabs.kdl` puts the 28-col sidebar left of the main pane, with Zellij's single-line
-`status-bar` (`size=1`) at the bottom to keep the key hints — matching the default layout's look.
+MIT, see [LICENSE](LICENSE).

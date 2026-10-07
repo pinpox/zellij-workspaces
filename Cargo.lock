@@ -647,12 +647,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
-name = "glob-match"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9985c9503b412198aa4197559e9a318524ebc4519c229bfa05a535828c950b9d"
-
-[[package]]
 name = "hashbrown"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2353,6 +2347,15 @@ dependencies = [
 
 [[package]]
 name = "windows-sys"
+version = "0.52.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "282be5f36a8ce781fad8c8ae18fa3f9beff57ec1b52cb3de0789201425d9a33d"
+dependencies = [
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows-sys"
 version = "0.59.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b"
@@ -2536,9 +2539,9 @@ dependencies = [
 
 [[package]]
 name = "zellij-utils"
-version = "0.44.3"
+version = "0.44.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b823df41cf824f6b9db45f50c3b2bc02cc66d9dd4db223392f19b02cff4a876"
+checksum = "dd3b8f962e5ffbfc3c378bbaf63893f469a652b57cbc1d95adc74f167aa023eb"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -2583,15 +2586,15 @@ dependencies = [
  "url",
  "uuid",
  "winapi",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
-name = "zellij-vtabs"
-version = "0.2.3"
+name = "zellij-workspaces"
+version = "0.3.0"
 dependencies = [
- "glob-match",
  "zellij-tile",
+ "zellij-utils",
 ]
 
 [[package]]

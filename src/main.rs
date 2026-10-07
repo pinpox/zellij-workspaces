@@ -2,7 +2,13 @@
 // methods they call look unused — silence that only for test builds.
 #![cfg_attr(test, allow(dead_code))]
 
+mod workspace;
+
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+use workspace::{
+    keybind_kdl, parse_info, run_ws, slug, workspace_dir, Dialog, WsInfo, NOT_A_REPO,
+};
 use zellij_tile::prelude::*;
 
 /// Blank lines above the tree / spaces to the left of each row (breathing room).
@@ -50,7 +56,7 @@ fn parse_spinner(config: Option<&String>) -> Vec<String> {
 /// One file per *session* (suffix = session name, learned from `ModeUpdate`) —
 /// different sessions have different groups, and a single shared file would let
 /// each session's save wipe the others' state.
-const STATE_FILE_PREFIX: &str = "/cache/vtabs-state-";
+const STATE_FILE_PREFIX: &str = "/cache/state-";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Attention {
@@ -67,118 +73,11 @@ fn marker_of(att: Attention) -> &'static str {
     }
 }
 
-/// Fallback grouping for auto-named tabs when no `autogroup_N` rule matches.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-enum AutoDefault {
-    /// group = owning git repo's name (worktree-aware); non-repo dirs are not renamed
-    Repo,
-    /// plain name = cwd basename (no group)
-    Dir,
-    /// only rename when a rule matches
-    #[default]
-    Off,
-}
-
-/// Facts about a pane's shell, piped in by `shell/vtabs.zsh` (`k=v` lines).
-/// Empty string = unknown/not applicable.
-#[derive(Default, PartialEq, Debug)]
-struct CwdFacts {
-    cwd: String,
-    /// `git rev-parse --path-format=absolute --show-toplevel`
-    toplevel: String,
-    /// `git rev-parse --path-format=absolute --git-common-dir` (main repo's .git)
-    common: String,
-    branch: String,
-}
-
-fn parse_facts(payload: &str) -> CwdFacts {
-    let mut f = CwdFacts::default();
-    for line in payload.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let v = v.trim_end_matches('/').to_string();
-            match k {
-                "cwd" => f.cwd = v,
-                "toplevel" => f.toplevel = v,
-                "common" => f.common = v,
-                "branch" => f.branch = v,
-                _ => {}
-            }
-        }
-    }
-    f
-}
-
-fn basename(path: &str) -> &str {
-    path.trim_end_matches('/').rsplit('/').next().unwrap_or(path)
-}
-
-/// Zellij's default names for unnamed tabs ("Tab #1", …) — the only names
-/// auto-grouping is allowed to overwrite (manual names always win).
+/// Zellij's default names for unnamed tabs ("Tab #1", …): such a tab gets its
+/// workspace name probed once, without waiting for a cwd change.
 fn is_default_tab_name(name: &str) -> bool {
     name.strip_prefix("Tab #")
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// `autogroup_N "glob -> group"` config keys, in numeric order.
-fn parse_autogroup_rules(configuration: &BTreeMap<String, String>) -> Vec<(String, String)> {
-    let mut numbered: Vec<(u32, (String, String))> = configuration
-        .iter()
-        .filter_map(|(k, v)| {
-            let n: u32 = k.strip_prefix("autogroup_")?.parse().ok()?;
-            let (pattern, group) = v.split_once(" -> ")?;
-            Some((n, (pattern.trim().to_string(), group.trim().to_string())))
-        })
-        .collect();
-    numbered.sort_by_key(|(n, _)| *n);
-    numbered.into_iter().map(|(_, rule)| rule).collect()
-}
-
-/// Derive `group:label` (or a plain name) for a pane's cwd facts.
-/// None = leave the tab alone.
-fn derive_auto_name(
-    default: AutoDefault,
-    rules: &[(String, String)],
-    f: &CwdFacts,
-) -> Option<String> {
-    if f.cwd.is_empty() {
-        return None;
-    }
-    // main repo's root dir, from its .git dir (worktrees share it)
-    let owner_path = f.common.strip_suffix("/.git").unwrap_or("");
-    let label = if !f.toplevel.is_empty() && !owner_path.is_empty() && f.toplevel != owner_path {
-        basename(&f.toplevel) // linked worktree: its dir name (e.g. fix-auth)
-    } else if !f.toplevel.is_empty() && f.cwd != f.toplevel {
-        basename(&f.cwd)
-    } else if !f.branch.is_empty() {
-        &f.branch
-    } else {
-        basename(&f.cwd)
-    };
-    if label.is_empty() {
-        return None; // e.g. cwd = "/" — never produce an empty name
-    }
-    let rule_group = rules.iter().find_map(|(pattern, group)| {
-        (f.cwd == pattern.trim_end_matches("/**") || glob_match::glob_match(pattern, &f.cwd))
-            .then_some(group.as_str())
-    });
-    match (rule_group, default) {
-        (Some(g), _) => Some(format!("{}:{}", g, label)),
-        (None, AutoDefault::Repo) => {
-            let owner = if !owner_path.is_empty() {
-                owner_path
-            } else if !f.toplevel.is_empty() {
-                &f.toplevel
-            } else {
-                return None; // not in a git repo: leave the tab alone
-            };
-            Some(format!("{}:{}", basename(owner), label))
-        }
-        (None, AutoDefault::Dir) => {
-            let name = basename(&f.cwd);
-            (!name.is_empty()).then(|| name.to_string())
-        }
-        (None, AutoDefault::Off) => None,
-    }
 }
 
 /// Rollup priority for collapsed group headers: waiting > working > completed.
@@ -323,8 +222,22 @@ struct State {
     separator: char,
     waiting_icon: String,
     completed_icon: String,
-    autogroup_default: AutoDefault,
-    autogroup_rules: Vec<(String, String)>,
+    /// what this instance is: the per-tab sidebar or a one-shot dialog
+    mode: Mode,
+    plugin_id: u32,
+    /// position of the tab this instance's own pane lives in, and its URL
+    /// (both from PaneUpdate)
+    own_tab: Option<usize>,
+    own_url: Option<String>,
+    /// tiled terminal panes of the own tab, in manifest order
+    own_terminal_panes: Vec<u32>,
+    granted: bool,
+    keys_bound: bool,
+    new_key: String,
+    close_key: String,
+    /// tab id whose default "Tab #N" name was already probed
+    probed_tab: Option<usize>,
+    dialog: Dialog,
     /// active inline rename edit: (target, input buffer)
     renaming: Option<(RenameTarget, String)>,
     /// animation frames (from the `spinner` config key), frame counter, and
@@ -563,26 +476,100 @@ impl State {
         }
     }
 
-    /// Auto-name the tab containing `pane_id` from its shell's cwd facts.
-    /// Unless `force`, only tabs still carrying a default "Tab #N" name are touched.
-    fn auto_rename(&self, pane_id: u32, payload: &str, force: bool) {
+    /// Ask the host which workspace `cwd` belongs to; the answer renames the
+    /// tab of `pane_id` (see `rename_for_workspace`).
+    fn probe_name(&self, pane_id: u32, cwd: &Path) {
+        let context = BTreeMap::from([
+            ("op".to_string(), "name".to_string()),
+            ("pane".to_string(), pane_id.to_string()),
+        ]);
+        run_ws(&["info"], &cwd.to_string_lossy(), context);
+    }
+
+    /// Name the tab containing `pane_id` `project:workspace`, keeping its
+    /// attention marker.
+    fn rename_for_workspace(&self, pane_id: u32, info: &WsInfo) {
         let Some(t) = self.fresh_tab(pane_id) else {
             return;
         };
         let (att, base) = parse_attention(&t.name);
-        if !force && !is_default_tab_name(base) {
+        let name = info.tab_name(self.separator);
+        if base != name {
+            let marker = att.map(marker_of).unwrap_or("");
+            rename_tab_with_id(t.tab_id as u64, format!("{}{}", name, marker));
+        }
+    }
+
+    /// Shells only report a cwd *change*, so a tab whose shell starts inside a
+    /// repository (first tab, `Ctrl t n`) still has its default name: probe its
+    /// first pane's cwd once.
+    fn probe_default_tab(&mut self) {
+        if !self.granted {
             return;
         }
-        let facts = parse_facts(payload);
-        let Some(name) = derive_auto_name(self.autogroup_default, &self.autogroup_rules, &facts)
+        let Some(tab) = self
+            .own_tab
+            .and_then(|pos| self.tabs.iter().find(|t| t.position == pos))
         else {
             return;
         };
-        if base == name {
+        if self.probed_tab == Some(tab.tab_id) || !is_default_tab_name(parse_attention(&tab.name).1)
+        {
             return;
         }
-        let marker = att.map(marker_of).unwrap_or("");
-        rename_tab_with_id(t.tab_id as u64, format!("{}{}", name, marker));
+        let Some(&pane_id) = self.own_terminal_panes.first() else {
+            return;
+        };
+        self.probed_tab = Some(tab.tab_id);
+        if let Ok(cwd) = get_pane_cwd(PaneId::Terminal(pane_id)) {
+            self.probe_name(pane_id, &cwd);
+        }
+    }
+
+    /// Register the create/remove keybindings (in memory, not written to the
+    /// user's config). Every sidebar instance binds the same keys to the same
+    /// action, so repeating this per tab is harmless.
+    fn bind_keys(&mut self) {
+        if self.keys_bound || !self.granted {
+            return;
+        }
+        let Some(url) = &self.own_url else {
+            return;
+        };
+        if let Some(kdl) = keybind_kdl(url, &self.new_key, &self.close_key) {
+            reconfigure(kdl, false);
+        }
+        self.keys_bound = true;
+    }
+
+    fn update_panes(&mut self, manifest: &PaneManifest) {
+        self.pane_tab.clear();
+        for (tab_pos, panes) in &manifest.panes {
+            for p in panes {
+                if !p.is_plugin {
+                    self.pane_tab.insert(p.id, *tab_pos);
+                } else if p.id == self.plugin_id {
+                    self.own_tab = Some(*tab_pos);
+                    self.own_url = p.plugin_url.clone();
+                }
+            }
+        }
+        self.own_terminal_panes = self
+            .own_tab
+            .and_then(|pos| manifest.panes.get(&pos))
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter(|p| !p.is_plugin && !p.is_floating)
+                    .map(|p| p.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+
+    fn own_tab_id(&self) -> Option<usize> {
+        let pos = self.own_tab?;
+        self.tabs.iter().find(|t| t.position == pos).map(|t| t.tab_id)
     }
 
     /// Strip a *seen* attention marker from the tab at `pos` (global rename).
@@ -847,6 +834,195 @@ impl State {
     }
 }
 
+/// `mode` plugin config: the layout's sidebar, or a dialog launched by the
+/// keybindings the sidebar registers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum Mode {
+    #[default]
+    Sidebar,
+    New,
+    Close,
+}
+
+fn command_error(code: Option<i32>, stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("command failed (exit code {:?})", code)
+    } else {
+        stderr.to_string()
+    }
+}
+
+impl State {
+    fn update_dialog(&mut self, event: Event) -> bool {
+        match event {
+            Event::PermissionRequestResult(status) => {
+                if status == PermissionStatus::Granted {
+                    let title = match self.mode {
+                        Mode::Close => "remove workspace",
+                        _ => "new workspace",
+                    };
+                    rename_plugin_pane(self.plugin_id, title);
+                    let cwd = get_plugin_ids().initial_cwd;
+                    let context = BTreeMap::from([("op".to_string(), "probe".to_string())]);
+                    run_ws(&["info"], &cwd.to_string_lossy(), context);
+                } else {
+                    self.dialog = Dialog::Error("permissions were denied".to_string());
+                }
+                true
+            }
+            Event::TabUpdate(tabs) => {
+                self.tabs = tabs;
+                false
+            }
+            Event::PaneUpdate(manifest) => {
+                self.update_panes(&manifest);
+                false
+            }
+            Event::RunCommandResult(code, stdout, stderr, context) => {
+                self.dialog_result(code, &stdout, &stderr, &context);
+                true
+            }
+            Event::Key(key) => self.dialog_key(key),
+            _ => false,
+        }
+    }
+
+    fn dialog_result(
+        &mut self,
+        code: Option<i32>,
+        stdout: &[u8],
+        stderr: &[u8],
+        context: &BTreeMap<String, String>,
+    ) {
+        let ok = code == Some(0);
+        match context.get("op").map(String::as_str) {
+            Some("probe") => {
+                self.dialog = match parse_info(&String::from_utf8_lossy(stdout)) {
+                    Some(info) if ok => match self.mode {
+                        Mode::Close if info.is_main() => Dialog::Error(format!(
+                            "{} is the main checkout of {}, not removing it",
+                            info.name,
+                            info.project()
+                        )),
+                        Mode::Close => Dialog::Confirm { info },
+                        _ => Dialog::Prompt { info, input: String::new() },
+                    },
+                    _ if code == Some(NOT_A_REPO) => Dialog::Error(format!(
+                        "not in a jj or git repository:\n{}",
+                        get_plugin_ids().initial_cwd.display()
+                    )),
+                    _ => Dialog::Error(command_error(code, stderr)),
+                };
+            }
+            Some("add") if ok => {
+                let tab = context.get("tab").map(String::as_str);
+                let dir = context.get("dir").map(String::as_str);
+                new_tab(tab, dir);
+                close_self();
+            }
+            Some("remove") if ok => {
+                if let Some(tab_id) = self.own_tab_id() {
+                    close_tab_with_id(tab_id as u64);
+                }
+                close_self();
+            }
+            Some("add") | Some("remove") => {
+                self.dialog = Dialog::Error(command_error(code, stderr));
+            }
+            _ => {}
+        }
+    }
+
+    fn dialog_key(&mut self, key: KeyWithModifier) -> bool {
+        let plain = key.key_modifiers.is_empty()
+            || (key.key_modifiers.len() == 1 && key.key_modifiers.contains(&KeyModifier::Shift));
+        self.dialog = match std::mem::take(&mut self.dialog) {
+            Dialog::Prompt { info, mut input } => match key.bare_key {
+                BareKey::Esc => {
+                    close_self();
+                    return false;
+                }
+                BareKey::Enter => match slug(&input) {
+                    Some(slug) => {
+                        let dir = workspace_dir(&info.main, &slug);
+                        let tab = format!("{}{}{}", info.project(), self.separator, slug);
+                        let context = BTreeMap::from([
+                            ("op".to_string(), "add".to_string()),
+                            ("dir".to_string(), dir.clone()),
+                            ("tab".to_string(), tab.clone()),
+                        ]);
+                        run_ws(&["add", &info.vcs, &dir, input.trim()], &info.root, context);
+                        Dialog::Running(format!("creating {}…", tab))
+                    }
+                    None => Dialog::Prompt { info, input },
+                },
+                BareKey::Backspace => {
+                    input.pop();
+                    Dialog::Prompt { info, input }
+                }
+                BareKey::Char(c) if plain && !c.is_control() => {
+                    input.push(c);
+                    Dialog::Prompt { info, input }
+                }
+                _ => Dialog::Prompt { info, input },
+            },
+            Dialog::Confirm { info } => match key.bare_key {
+                BareKey::Char('y') | BareKey::Char('Y') => {
+                    let context = BTreeMap::from([("op".to_string(), "remove".to_string())]);
+                    // run from the main checkout: the workspace directory is deleted
+                    run_ws(&["remove", &info.vcs, &info.root, &info.name], &info.main, context);
+                    Dialog::Running(format!("removing {}…", info.tab_name(self.separator)))
+                }
+                _ => {
+                    close_self();
+                    return false;
+                }
+            },
+            Dialog::Error(_) => {
+                close_self();
+                return false;
+            }
+            other => other,
+        };
+        true
+    }
+
+    fn render_dialog(&self, cols: usize) {
+        let text = match &self.dialog {
+            Dialog::Probing => "…".to_string(),
+            Dialog::Prompt { info, input } => format!(
+                "New workspace for {}\n\nname: {}▏\n\n\u{1b}[2mEnter create · Esc cancel\u{1b}[0m",
+                info.project(),
+                input
+            ),
+            Dialog::Confirm { info } => format!(
+                "Remove workspace {}?\n{}\n\n\u{1b}[2m{}\ny remove · any other key cancels\u{1b}[0m",
+                info.tab_name(self.separator),
+                info.root,
+                if info.vcs == "jj" {
+                    "jj: the workspace's changes stay in the repo"
+                } else {
+                    "git: refuses if the worktree has changes"
+                }
+            ),
+            Dialog::Running(msg) => msg.clone(),
+            Dialog::Error(msg) => format!(
+                "\u{1b}[31m{}\u{1b}[0m\n\n\u{1b}[2many key closes\u{1b}[0m",
+                msg
+            ),
+        };
+        let pad = " ".repeat(LEFT_PAD);
+        let mut out = "\r\n".repeat(TOP_PAD);
+        for line in text.lines() {
+            out.push_str(&truncate_visible(&format!("{}{}", pad, line), cols));
+            out.push_str("\r\n");
+        }
+        print!("{}", out);
+    }
+}
+
 #[cfg(not(test))]
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
@@ -862,20 +1038,27 @@ impl ZellijPlugin for State {
             .get("completed_icon")
             .cloned()
             .unwrap_or_else(|| "✓".to_string());
-        self.autogroup_default = match configuration
-            .get("autogroup_default")
-            .map(String::as_str)
-        {
-            Some("repo") => AutoDefault::Repo,
-            Some("dir") => AutoDefault::Dir,
-            _ => AutoDefault::Off,
-        };
-        self.autogroup_rules = parse_autogroup_rules(&configuration);
         self.spinner = parse_spinner(configuration.get("spinner"));
+        self.new_key = configuration
+            .get("new_key")
+            .cloned()
+            .unwrap_or_else(|| "Alt w".to_string());
+        self.close_key = configuration
+            .get("close_key")
+            .cloned()
+            .unwrap_or_else(|| "Alt W".to_string());
+        self.mode = match configuration.get("mode").map(String::as_str) {
+            Some("new") => Mode::New,
+            Some("close") => Mode::Close,
+            _ => Mode::Sidebar,
+        };
+        self.plugin_id = get_plugin_ids().plugin_id;
         request_permission(&[
             PermissionType::ReadApplicationState,
             PermissionType::ChangeApplicationState,
             PermissionType::ReadCliPipes,
+            PermissionType::RunCommands,
+            PermissionType::Reconfigure,
         ]);
         subscribe(&[
             EventType::ModeUpdate,
@@ -884,11 +1067,23 @@ impl ZellijPlugin for State {
             EventType::Key,
             EventType::Mouse,
             EventType::Timer,
+            EventType::CwdChanged,
+            EventType::RunCommandResult,
+            EventType::PermissionRequestResult,
         ]);
     }
 
     fn update(&mut self, event: Event) -> bool {
+        if self.mode != Mode::Sidebar {
+            return self.update_dialog(event);
+        }
         match event {
+            Event::PermissionRequestResult(status) => {
+                self.granted = status == PermissionStatus::Granted;
+                self.bind_keys();
+                self.probe_default_tab();
+                false
+            }
             Event::ModeUpdate(mode_info) => {
                 if mode_info.session_name != self.session {
                     self.session = mode_info.session_name;
@@ -918,6 +1113,7 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.ensure_timer();
+                self.probe_default_tab();
                 true
             }
             Event::Timer(_) => {
@@ -931,13 +1127,30 @@ impl ZellijPlugin for State {
                 }
             }
             Event::PaneUpdate(manifest) => {
-                self.pane_tab.clear();
-                for (tab_pos, panes) in &manifest.panes {
-                    for p in panes {
-                        if !p.is_plugin {
-                            self.pane_tab.insert(p.id, *tab_pos);
-                        }
-                    }
+                self.update_panes(&manifest);
+                self.bind_keys();
+                self.probe_default_tab();
+                false
+            }
+            // Every sidebar instance gets every cwd change; only the one in
+            // the pane's own tab acts on it.
+            Event::CwdChanged(PaneId::Terminal(pane_id), cwd, _) => {
+                if self.granted
+                    && self.own_tab.is_some()
+                    && self.pane_tab.get(&pane_id) == self.own_tab.as_ref()
+                {
+                    self.probe_name(pane_id, &cwd);
+                }
+                false
+            }
+            Event::RunCommandResult(Some(0), stdout, _, context)
+                if context.get("op").map(String::as_str) == Some("name") =>
+            {
+                let pane = context.get("pane").and_then(|p| p.parse::<u32>().ok());
+                if let (Some(pane), Some(info)) =
+                    (pane, parse_info(&String::from_utf8_lossy(&stdout)))
+                {
+                    self.rename_for_workspace(pane, &info);
                 }
                 false
             }
@@ -947,47 +1160,36 @@ impl ZellijPlugin for State {
         }
     }
 
-    /// Attention signals: `zellij-vtabs::waiting|completed::<pane_id>` (broadcast CLI pipe).
+    /// Attention signals: `zellij-workspaces::waiting|completed|working|clear-working::<pane_id>`
+    /// (broadcast CLI pipe).
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
-        if let Some(rest) = pipe_message.name.strip_prefix("zellij-vtabs::") {
-            let parts: Vec<&str> = rest.split("::").collect();
-            if parts.len() == 2 {
-                if let Ok(pane_id) = parts[1].parse::<u32>() {
-                    let payload = pipe_message.payload.as_deref().unwrap_or("");
-                    match parts[0] {
-                        "waiting" => {
-                            self.set_attention(pane_id, Attention::Waiting);
-                            return false;
-                        }
-                        "completed" => {
-                            self.set_attention(pane_id, Attention::Completed);
-                            return false;
-                        }
-                        "cwd" => {
-                            self.auto_rename(pane_id, payload, false);
-                            return false;
-                        }
-                        "cwd-force" => {
-                            self.auto_rename(pane_id, payload, true);
-                            return false;
-                        }
-                        "working" => {
-                            self.set_working(pane_id);
-                            return false;
-                        }
-                        "clear-working" => {
-                            self.clear_working(pane_id);
-                            return false;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        if self.mode != Mode::Sidebar {
+            return false;
+        }
+        let Some(rest) = pipe_message.name.strip_prefix("zellij-workspaces::") else {
+            return false;
+        };
+        let Some((signal, pane_id)) = rest.split_once("::") else {
+            return false;
+        };
+        let Ok(pane_id) = pane_id.parse::<u32>() else {
+            return false;
+        };
+        match signal {
+            "waiting" => self.set_attention(pane_id, Attention::Waiting),
+            "completed" => self.set_attention(pane_id, Attention::Completed),
+            "working" => self.set_working(pane_id),
+            "clear-working" => self.clear_working(pane_id),
+            _ => {}
         }
         false
     }
 
     fn render(&mut self, _rows: usize, cols: usize) {
+        if self.mode != Mode::Sidebar {
+            self.render_dialog(cols);
+            return;
+        }
         let visible = self.build_rows();
         let pad = " ".repeat(LEFT_PAD);
         let mut out = String::new();
@@ -1192,22 +1394,6 @@ mod tests {
         assert_eq!(order, vec!["a", "c", "b"]); // edges/missing leave order untouched
     }
 
-    fn facts(cwd: &str, toplevel: &str, common: &str, branch: &str) -> CwdFacts {
-        CwdFacts {
-            cwd: cwd.into(),
-            toplevel: toplevel.into(),
-            common: common.into(),
-            branch: branch.into(),
-        }
-    }
-
-    #[test]
-    fn parse_facts_reads_kv_lines_and_ignores_junk() {
-        let f = parse_facts("cwd=/a/b\ntoplevel=/a/b\ncommon=/a/b/.git\nbranch=main\nx\n");
-        assert_eq!(f, facts("/a/b", "/a/b", "/a/b/.git", "main"));
-        assert_eq!(parse_facts(""), CwdFacts::default());
-    }
-
     #[test]
     fn default_tab_names_detected() {
         assert!(is_default_tab_name("Tab #1"));
@@ -1215,79 +1401,6 @@ mod tests {
         assert!(!is_default_tab_name("Tab #"));
         assert!(!is_default_tab_name("Tab #1x"));
         assert!(!is_default_tab_name("work:api"));
-    }
-
-    #[test]
-    fn autogroup_rules_parse_in_numeric_order() {
-        let cfg: BTreeMap<String, String> = [
-            ("autogroup_10".to_string(), "/b/** -> bee".to_string()),
-            ("autogroup_2".to_string(), "/a/** -> ay".to_string()),
-            ("autogroup_default".to_string(), "repo".to_string()),
-            ("autogroup_x".to_string(), "/junk/** -> nope".to_string()),
-            ("separator".to_string(), ":".to_string()),
-        ]
-        .into();
-        assert_eq!(
-            parse_autogroup_rules(&cfg),
-            vec![
-                ("/a/**".to_string(), "ay".to_string()),
-                ("/b/**".to_string(), "bee".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn derive_repo_mode_names() {
-        use AutoDefault::*;
-        // at repo root: group = repo, label = branch
-        assert_eq!(
-            derive_auto_name(Repo, &[], &facts("/c/app", "/c/app", "/c/app/.git", "main")),
-            Some("app:main".to_string())
-        );
-        // in a subdir: label = dir basename
-        assert_eq!(
-            derive_auto_name(Repo, &[], &facts("/c/app/src", "/c/app", "/c/app/.git", "main")),
-            Some("app:src".to_string())
-        );
-        // linked worktree: group = owning repo, label = worktree dir
-        assert_eq!(
-            derive_auto_name(
-                Repo,
-                &[],
-                &facts(
-                    "/c/app/.claude/worktrees/fix-auth",
-                    "/c/app/.claude/worktrees/fix-auth",
-                    "/c/app/.git",
-                    "fix-auth"
-                )
-            ),
-            Some("app:fix-auth".to_string())
-        );
-        // not a repo: leave alone
-        assert_eq!(derive_auto_name(Repo, &[], &facts("/tmp/x", "", "", "")), None);
-    }
-
-    #[test]
-    fn derive_rule_dir_and_off_modes() {
-        use AutoDefault::*;
-        let rules = vec![("/w/**".to_string(), "work".to_string())];
-        // rule wins over default, exact base dir matches too
-        assert_eq!(
-            derive_auto_name(Off, &rules, &facts("/w/app", "/w/app", "/w/app/.git", "dev")),
-            Some("work:dev".to_string())
-        );
-        assert_eq!(
-            derive_auto_name(Repo, &rules, &facts("/w", "", "", "")),
-            Some("work:w".to_string())
-        );
-        // dir mode: plain basename, ungrouped
-        assert_eq!(
-            derive_auto_name(Dir, &[], &facts("/tmp/scratch", "", "", "")),
-            Some("scratch".to_string())
-        );
-        // off + no match: leave alone
-        assert_eq!(derive_auto_name(Off, &[], &facts("/tmp/x", "", "", "")), None);
-        assert_eq!(derive_auto_name(Off, &[], &CwdFacts::default()), None);
     }
 
     #[test]
@@ -1314,16 +1427,6 @@ mod tests {
         // renaming into an existing group must not duplicate it in the order
         s.migrate_group_state("proj", "misc");
         assert_eq!(s.group_order, vec!["misc"]);
-    }
-
-    #[test]
-    fn derive_never_produces_empty_names() {
-        use AutoDefault::*;
-        assert_eq!(derive_auto_name(Repo, &[], &facts("", "", "", "")), None);
-        assert_eq!(derive_auto_name(Dir, &[], &facts("", "", "", "")), None);
-        let rules = vec![("/**".to_string(), "g".to_string())];
-        // basename of "" (parse_facts trims "/" to "") — no "g:" ghost tab
-        assert_eq!(derive_auto_name(Off, &rules, &facts("", "", "", "")), None);
     }
 
     #[test]

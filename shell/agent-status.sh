@@ -1,5 +1,5 @@
 #!/bin/sh
-# Track Claude Code work state per pane and drive the zellij-vtabs indicator,
+# Track Claude Code work state per pane and drive the zellij-workspaces indicator,
 # counting outstanding subagents so the spinner stays lit for the WHOLE task.
 #
 # Why a counter: `Stop` fires once per main-agent turn, but subagents run on a
@@ -9,19 +9,18 @@
 # show the completed check when BOTH are done.
 #
 # Usage (from ~/.claude/settings.json hooks, each backgrounded):
-#   UserPromptSubmit -> vtabs-work.sh prompt
-#   SubagentStart    -> vtabs-work.sh subagent-start
-#   SubagentStop     -> vtabs-work.sh subagent-stop
-#   Stop             -> vtabs-work.sh stop
-#   Notification     -> vtabs-work.sh notify
-#   SessionEnd       -> vtabs-work.sh end
+#   UserPromptSubmit -> agent-status.sh prompt
+#   SubagentStart    -> agent-status.sh subagent-start
+#   SubagentStop     -> agent-status.sh subagent-stop
+#   Stop             -> agent-status.sh stop
+#   Notification     -> agent-status.sh notify
+#   SessionEnd       -> agent-status.sh end
 #
-# Set VTABS_WORK_DRYRUN=1 to print the computed signal instead of piping it
-# (used by the tests).
+# Set AGENT_STATUS_DRYRUN=1 to print the computed signal instead of piping it.
 [ -n "$ZELLIJ" ] && [ -n "$ZELLIJ_PANE_ID" ] || exit 0
 
 event="$1"
-dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/zellij-vtabs"
+dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/zellij-workspaces"
 mkdir -p "$dir" 2>/dev/null || exit 0
 state="$dir/pane-$ZELLIJ_PANE_ID"
 
@@ -72,11 +71,11 @@ case "$signal" in
   waiting)   sound="message-new-instant" ;;
 esac
 
-if [ -n "$VTABS_WORK_DRYRUN" ]; then
+if [ -n "$AGENT_STATUS_DRYRUN" ]; then
   echo "$signal ${sound:--}"
   exit 0
 fi
 
 [ -n "$sound" ] && (canberra-gtk-play -i "$sound" >/dev/null 2>&1 \
   || pw-play "/usr/share/sounds/freedesktop/stereo/$sound.oga" >/dev/null 2>&1 || true &)
-exec timeout 3 zellij pipe --name "zellij-vtabs::$signal::$ZELLIJ_PANE_ID" < /dev/null
+exec timeout 3 zellij pipe --name "zellij-workspaces::$signal::$ZELLIJ_PANE_ID" < /dev/null
