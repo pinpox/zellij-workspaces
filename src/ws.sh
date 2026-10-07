@@ -7,12 +7,16 @@
 #
 #   info              print "<vcs>\t<main root>\t<workspace root>\t<workspace name>"
 #                     for DIR; exit 3 when DIR is not in a jj or git repository
-#   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME);
-#                     succeeds without changes if PATH already is a workspace of
-#                     this repository, so the plugin just opens it again
+#   list              print "<name>\t<root>" for each workspace/worktree of the
+#                     repository except the main checkout, if its directory exists
+#   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME;
+#                     jj: on top of bookmark NAME if it exists); succeeds without
+#                     changes if PATH already is a workspace of this repository,
+#                     so the plugin just opens it again
 #   remove VCS ROOT NAME
-#                     jj: forget workspace NAME (its changes stay in the repo) and
-#                     delete ROOT; git: `git worktree remove ROOT` (refuses if dirty)
+#                     jj: point bookmark NAME at the work only this workspace has,
+#                     forget it and delete ROOT; git: `git worktree remove ROOT`
+#                     (refuses if dirty; the branch stays)
 set -eu
 
 info() {
@@ -40,12 +44,30 @@ info() {
   fi
 }
 
+# quote a string for a jj revset string literal
+revset_str() {
+  printf '"%s"' "$(printf %s "$1" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+}
+
 cd "$1"
 cmd=$2
 shift 2
 case $cmd in
 info)
   info
+  ;;
+list)
+  main=$(info | cut -f2)
+  if [ "$(info | cut -f1)" = jj ]; then
+    jj workspace list --ignore-working-copy -T 'name ++ "\t" ++ root ++ "\n"'
+  else
+    git worktree list --porcelain | sed -n 's/^worktree //p' |
+      while IFS= read -r root; do printf '%s\t%s\n' "$(basename "$root")" "$root"; done
+  fi | while IFS="$(printf '\t')" read -r name root; do
+    if [ -n "$root" ] && [ "$root" != "$main" ] && [ -d "$root" ]; then
+      printf '%s\t%s\n' "$name" "$root"
+    fi
+  done
   ;;
 add)
   vcs=$1 dir=$2 name=$3
@@ -62,7 +84,14 @@ add)
   fi
   mkdir -p "$(dirname "$dir")"
   if [ "$vcs" = jj ]; then
-    jj workspace add --name "$(basename "$dir")" "$dir"
+    slug=$(basename "$dir")
+    # continue the work a removed workspace of this name left behind
+    bookmark="bookmarks(exact:$(revset_str "$slug"))"
+    if [ -n "$(jj log --ignore-working-copy --no-graph -r "$bookmark" -T 'commit_id')" ]; then
+      jj workspace add --name "$slug" -r "$bookmark" "$dir"
+    else
+      jj workspace add --name "$slug" "$dir"
+    fi
   elif git show-ref --verify --quiet "refs/heads/$name"; then
     git worktree add "$dir" "$name"
   else
@@ -75,6 +104,20 @@ remove)
     # forget runs from another workspace: snapshot first, or edits made in
     # this one since its last jj command are lost
     jj --repository "$root" util snapshot
+    # keep the work only this workspace has reachable by name, like a branch
+    ws="$(revset_str "$name")@"
+    own="::$ws ~ ::(working_copies() ~ $ws)"
+    work="($own) ~ empty()"
+    if [ -n "$(jj log --ignore-working-copy --no-graph -r "$work" -T 'commit_id')" ]; then
+      # only move a same-named bookmark if it already marks this workspace's
+      # own work (from an earlier remove/reopen), never e.g. one on trunk
+      bookmark="bookmarks(exact:$(revset_str "$name"))"
+      if [ -n "$(jj log --ignore-working-copy --no-graph -r "$bookmark ~ ($own)" -T 'commit_id')" ]; then
+        echo "bookmark $name points outside this workspace; not removing it, so its work keeps a name" >&2
+        exit 1
+      fi
+      jj bookmark set "$name" --allow-backwards -r "latest(heads($work))"
+    fi
     jj workspace forget "$name"
     rm -rf -- "$root"
   else

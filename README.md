@@ -21,15 +21,25 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
   Directories outside a repository leave the name alone.
 - **Grouped, collapsible sidebar.** `group:label` tabs are shown under `group`; other
   tabs land in **General**. Groups and tabs can be reordered, collapsed and renamed.
-- **`Alt w`: new workspace** for the focused pane's repository. Asks for a name,
-  creates it next to the main checkout in `<project>.ws/<name>` (jj: `jj workspace
-  add`; git: `git worktree add`, new branch `<name>` unless it exists, `/` in the name
-  becomes `-` in the directory) and opens it in a new tab. The name of an existing
-  workspace opens it again.
+- **`Alt w`: new or existing workspace** for the focused pane's repository. Lists the
+  repository's workspaces on disk (type to filter, `↑`/`↓` to pick, `Tab` to complete);
+  picking one, or typing its exact name, opens it, or switches to its tab if it has one.
+  A new name creates the workspace next to the main checkout in `<project>.ws/<name>`
+  (jj: `jj workspace add`, on top of bookmark `<name>` if it exists; git:
+  `git worktree add`, new branch `<name>` unless it exists; `/` in the name becomes `-`
+  in the directory) and opens it in a new tab.
 - **`Alt W`: remove the focused tab's workspace** after a `y` confirmation and close the
-  tab. jj: the workspace is snapshotted and forgotten, its changes stay in the repo, the
-  directory is deleted. git: `git worktree remove`, which refuses if the worktree has
-  changes. The main checkout is never removed.
+  tab. Work done in it is never lost:
+  - jj: the workspace is snapshotted, bookmark `<name>` is set on its newest change
+    that only this workspace has (if there is any), then the workspace is forgotten and
+    its directory deleted. Creating a workspace with the same name later continues on
+    that bookmark. An unrelated bookmark with that name is never moved; removal is
+    refused instead.
+  - git: `git worktree remove`, which refuses if the worktree has uncommitted or
+    untracked changes; the branch stays.
+
+  Files ignored by `.gitignore` are deleted with the directory. The main checkout is
+  never removed.
 - **Closing tabs works as without the sidebar.** When the last pane of a tab exits, the
   tab closes; when that was the last tab, the session ends. Closing a tab keeps its
   workspace on disk (reopen it with `Alt w`), and a group disappears from the sidebar

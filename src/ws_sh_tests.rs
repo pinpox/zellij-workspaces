@@ -127,6 +127,75 @@ fn jj_main_checkout_found_when_no_workspace_is_named_default() {
 }
 
 #[test]
+fn jj_remove_bookmarks_the_work_and_reopening_continues_it() {
+    let sb = Sandbox::new("jj-bookmark");
+    let main = sb.dir.join("proj");
+    sb.run("jj", &["git", "init", "proj"], &sb.dir);
+    fs::write(main.join("f"), "a").unwrap();
+    sb.run("jj", &["commit", "-m", "init"], &main);
+    let ws = sb.dir.join("proj.ws");
+    let text = |out: Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // committed work plus an unsnapshotted edit on top
+    let dir = ws.join("feat");
+    assert!(sb.ws(&["add", "jj", &s(&dir), "feat"], &main).status.success());
+    fs::write(dir.join("one"), "1").unwrap();
+    sb.run("jj", &["commit", "-m", "one"], &dir);
+    fs::write(dir.join("two"), "2").unwrap();
+    let out = sb.ws(&["remove", "jj", &s(&dir), "feat"], &main);
+    assert!(out.status.success(), "remove: {}", stderr(&out));
+    let files = sb.run("jj", &["file", "list", "-r", "feat"], &main);
+    assert_eq!(text(files), "f\none\ntwo", "bookmark feat must hold all of the work");
+
+    // reopening by name continues on top of the bookmark
+    assert!(sb.ws(&["add", "jj", &s(&dir), "feat"], &main).status.success());
+    let parent = sb.run("jj", &["log", "--no-graph", "-r", "@-", "-T", "bookmarks"], &dir);
+    assert_eq!(text(parent), "feat");
+    assert!(dir.join("two").exists());
+
+    // a workspace without work of its own gets no bookmark
+    let idle = ws.join("idle");
+    assert!(sb.ws(&["add", "jj", &s(&idle), "idle"], &main).status.success());
+    assert!(sb.ws(&["remove", "jj", &s(&idle), "idle"], &main).status.success());
+    let list = sb.run("jj", &["bookmark", "list", "-T", "name ++ \"\\n\""], &main);
+    assert_eq!(text(list), "feat");
+
+    // an unrelated bookmark with the workspace's name is not moved
+    let other = ws.join("taken");
+    sb.run("jj", &["bookmark", "create", "taken", "-r", "@-"], &main);
+    assert!(sb.ws(&["add", "jj", &s(&other), "x"], &main).status.success());
+    fs::write(other.join("w"), "w").unwrap();
+    let out = sb.ws(&["remove", "jj", &s(&other), "taken"], &main);
+    assert!(!out.status.success(), "moved an unrelated bookmark");
+    assert!(other.exists());
+}
+
+#[test]
+fn list_shows_other_workspaces_on_disk() {
+    let sb = Sandbox::new("list");
+    let main = sb.dir.join("proj");
+    sb.run("jj", &["git", "init", "proj"], &sb.dir);
+    let gmain = sb.dir.join("gproj");
+    sb.run("git", &["init", "-q", "gproj"], &sb.dir);
+    sb.run("git", &["commit", "-q", "--allow-empty", "-m", "init"], &gmain);
+
+    for (vcs, m) in [("jj", &main), ("git", &gmain)] {
+        let a = m.with_extension("ws").join("a");
+        let b = m.with_extension("ws").join("b");
+        assert!(sb.ws(&["add", vcs, &s(&a), "a"], m).status.success());
+        assert!(sb.ws(&["add", vcs, &s(&b), "b"], m).status.success());
+        let out = sb.ws(&["list"], &b);
+        assert!(out.status.success(), "{} list: {}", vcs, stderr(&out));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("a\t{}\nb\t{}\n", s(&a), s(&b)),
+            "{}: main checkout excluded, from any workspace",
+            vcs
+        );
+    }
+}
+
+#[test]
 fn add_reopens_an_existing_workspace_and_refuses_foreign_directories() {
     let sb = Sandbox::new("reopen");
     let jj_main = sb.dir.join("proj");

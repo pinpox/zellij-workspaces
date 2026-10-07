@@ -7,7 +7,8 @@ mod workspace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use workspace::{
-    keybind_kdl, parse_info, run_ws, slug, workspace_dir, Dialog, WsInfo, NOT_A_REPO,
+    keybind_kdl, parse_info, parse_list, run_ws, slug, workspace_dir, Choice, Dialog, Prompt,
+    WsInfo, NOT_A_REPO,
 };
 use zellij_tile::prelude::*;
 
@@ -975,7 +976,12 @@ impl State {
                             info.project()
                         )),
                         Mode::Close => Dialog::Confirm { info },
-                        _ => Dialog::Prompt { info, input: String::new() },
+                        _ => {
+                            let context =
+                                BTreeMap::from([("op".to_string(), "list".to_string())]);
+                            run_ws(&["list"], &info.root, context);
+                            Dialog::Prompt { info, prompt: Prompt::default() }
+                        }
                     },
                     _ if code == Some(NOT_A_REPO) => Dialog::Error(format!(
                         "not in a jj or git repository:\n{}",
@@ -984,10 +990,15 @@ impl State {
                     _ => Dialog::Error(command_error(code, stderr)),
                 };
             }
+            Some("list") if ok => {
+                if let Dialog::Prompt { prompt, .. } = &mut self.dialog {
+                    prompt.existing = parse_list(&String::from_utf8_lossy(stdout));
+                }
+            }
             Some("add") if ok => {
-                let tab = context.get("tab").map(String::as_str);
-                let dir = context.get("dir").map(String::as_str);
-                new_tab(tab, dir);
+                if let (Some(tab), Some(dir)) = (context.get("tab"), context.get("dir")) {
+                    self.open_tab(tab, dir);
+                }
                 close_self();
             }
             Some("remove") if ok => {
@@ -1003,39 +1014,62 @@ impl State {
         }
     }
 
+    /// The tab already showing workspace tab name `name`, if any.
+    fn tab_named(&self, name: &str) -> Option<&TabInfo> {
+        self.tabs.iter().find(|t| parse_attention(&t.name).1 == name)
+    }
+
+    /// Switch to the workspace's tab, or open one in `dir`.
+    fn open_tab(&self, name: &str, dir: &str) {
+        match self.tab_named(name) {
+            Some(t) => switch_tab_to(t.position as u32 + 1),
+            None => {
+                new_tab(Some(name), Some(dir));
+            }
+        }
+    }
+
     fn dialog_key(&mut self, key: KeyWithModifier) -> bool {
         let plain = key.key_modifiers.is_empty()
             || (key.key_modifiers.len() == 1 && key.key_modifiers.contains(&KeyModifier::Shift));
         self.dialog = match std::mem::take(&mut self.dialog) {
-            Dialog::Prompt { info, mut input } => match key.bare_key {
-                BareKey::Esc => {
-                    close_self();
-                    return false;
-                }
-                BareKey::Enter => match slug(&input) {
-                    Some(slug) => {
-                        let dir = workspace_dir(&info.main, &slug);
-                        let tab = format!("{}{}{}", info.project(), self.separator, slug);
-                        let context = BTreeMap::from([
-                            ("op".to_string(), "add".to_string()),
-                            ("dir".to_string(), dir.clone()),
-                            ("tab".to_string(), tab.clone()),
-                        ]);
-                        run_ws(&["add", &info.vcs, &dir, input.trim()], &info.root, context);
-                        Dialog::Running(format!("creating {}…", tab))
+            Dialog::Prompt { info, mut prompt } => {
+                match key.bare_key {
+                    BareKey::Esc => {
+                        close_self();
+                        return false;
                     }
-                    None => Dialog::Prompt { info, input },
-                },
-                BareKey::Backspace => {
-                    input.pop();
-                    Dialog::Prompt { info, input }
+                    BareKey::Enter => match prompt.choice() {
+                        Choice::Existing(e) => {
+                            let tab = format!("{}{}{}", info.project(), self.separator, e.name);
+                            self.open_tab(&tab, &e.root);
+                            close_self();
+                            return false;
+                        }
+                        Choice::New(name) => {
+                            let slug = slug(&name).unwrap_or_default();
+                            let dir = workspace_dir(&info.main, &slug);
+                            let tab = format!("{}{}{}", info.project(), self.separator, slug);
+                            let context = BTreeMap::from([
+                                ("op".to_string(), "add".to_string()),
+                                ("dir".to_string(), dir.clone()),
+                                ("tab".to_string(), tab.clone()),
+                            ]);
+                            run_ws(&["add", &info.vcs, &dir, &name], &info.root, context);
+                            self.dialog = Dialog::Running(format!("creating {}…", tab));
+                            return true;
+                        }
+                        Choice::Nothing => {}
+                    },
+                    BareKey::Up => prompt.move_selection(-1),
+                    BareKey::Down => prompt.move_selection(1),
+                    BareKey::Tab => prompt.complete(),
+                    BareKey::Backspace => prompt.backspace(),
+                    BareKey::Char(c) if plain && !c.is_control() => prompt.type_char(c),
+                    _ => {}
                 }
-                BareKey::Char(c) if plain && !c.is_control() => {
-                    input.push(c);
-                    Dialog::Prompt { info, input }
-                }
-                _ => Dialog::Prompt { info, input },
-            },
+                Dialog::Prompt { info, prompt }
+            }
             Dialog::Confirm { info } => match key.bare_key {
                 BareKey::Char('y') | BareKey::Char('Y') => {
                     let context = BTreeMap::from([("op".to_string(), "remove".to_string())]);
@@ -1060,19 +1094,38 @@ impl State {
     fn render_dialog(&self, cols: usize) {
         let text = match &self.dialog {
             Dialog::Probing => "…".to_string(),
-            Dialog::Prompt { info, input } => format!(
-                "Workspace for {}\n\nname: {}▏\n\n\u{1b}[2mEnter create, or open an existing one · Esc cancel\u{1b}[0m",
-                info.project(),
-                input
-            ),
+            Dialog::Prompt { info, prompt } => {
+                let mut text = format!(
+                    "Workspace for {}\n\nname: {}▏\n",
+                    info.project(),
+                    prompt.input
+                );
+                let matches = prompt.matches();
+                if !matches.is_empty() {
+                    text.push_str("\n\u{1b}[2mexisting:\u{1b}[0m\n");
+                }
+                for (i, e) in matches.iter().enumerate() {
+                    let tab = format!("{}{}{}", info.project(), self.separator, e.name);
+                    let open = if self.tab_named(&tab).is_some() { "  \u{1b}[2m(open)\u{1b}[0m" } else { "" };
+                    if prompt.selected == Some(i) {
+                        text.push_str(&format!("\u{1b}[7m› {}\u{1b}[0m{}\n", e.name, open));
+                    } else {
+                        text.push_str(&format!("  {}{}\n", e.name, open));
+                    }
+                }
+                text.push_str(
+                    "\n\u{1b}[2mEnter create or open · ↑↓ pick · Tab complete · Esc cancel\u{1b}[0m",
+                );
+                text
+            }
             Dialog::Confirm { info } => format!(
                 "Remove workspace {}?\n{}\n\n\u{1b}[2m{}\ny remove · any other key cancels\u{1b}[0m",
                 info.tab_name(self.separator),
                 info.root,
                 if info.vcs == "jj" {
-                    "jj: the workspace's changes stay in the repo"
+                    "jj: its work stays in the repo, under a bookmark of the same name"
                 } else {
-                    "git: refuses if the worktree has changes"
+                    "git: the branch stays; refuses if the worktree has changes"
                 }
             ),
             Dialog::Running(msg) => msg.clone(),

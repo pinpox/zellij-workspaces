@@ -122,14 +122,117 @@ pub fn run_ws(args: &[&str], dir: &str, context: BTreeMap<String, String>) {
 #[cfg(test)]
 pub fn run_ws(_args: &[&str], _dir: &str, _context: BTreeMap<String, String>) {}
 
+/// A workspace of the repository that exists on disk (`ws.sh list`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Existing {
+    pub name: String,
+    pub root: String,
+}
+
+pub fn parse_list(stdout: &str) -> Vec<Existing> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let (name, root) = line.split_once('\t')?;
+            (!name.is_empty() && !root.is_empty()).then(|| Existing {
+                name: name.to_string(),
+                root: root.to_string(),
+            })
+        })
+        .collect()
+}
+
+/// What Enter in the name prompt does.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Choice {
+    /// open (or switch to) an existing workspace
+    Existing(Existing),
+    /// create a workspace with this name
+    New(String),
+    Nothing,
+}
+
+/// The create dialog's name input with existing workspaces as suggestions.
+/// `selected` indexes `matches()`; None means the typed name.
+#[derive(Debug, PartialEq, Default)]
+pub struct Prompt {
+    pub input: String,
+    pub existing: Vec<Existing>,
+    pub selected: Option<usize>,
+}
+
+impl Prompt {
+    /// Existing workspaces whose name contains the input (case-insensitive).
+    pub fn matches(&self) -> Vec<&Existing> {
+        let needle = self.input.trim().to_lowercase();
+        self.existing
+            .iter()
+            .filter(|e| e.name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Move through the matches; moving up from the first one returns to the
+    /// typed name.
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.matches().len() as isize;
+        let next = self.selected.map_or(-1, |i| i as isize) + delta;
+        self.selected = if len == 0 || next < 0 {
+            None
+        } else {
+            Some(next.min(len - 1) as usize)
+        };
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        self.input.push(c);
+        self.selected = None;
+    }
+
+    pub fn backspace(&mut self) {
+        self.input.pop();
+        self.selected = None;
+    }
+
+    /// Complete the input to the selected (or only/first) match.
+    pub fn complete(&mut self) {
+        let name = {
+            let matches = self.matches();
+            self.selected
+                .and_then(|i| matches.get(i))
+                .or(matches.first())
+                .map(|e| e.name.clone())
+        };
+        if let Some(name) = name {
+            self.input = name;
+            self.selected = None;
+        }
+    }
+
+    pub fn choice(&self) -> Choice {
+        let matches = self.matches();
+        if let Some(e) = self.selected.and_then(|i| matches.get(i)) {
+            return Choice::Existing((*e).clone());
+        }
+        let typed = self.input.trim();
+        // typing an existing name exactly opens it, wherever it lives
+        if let Some(e) = self.existing.iter().find(|e| e.name == typed) {
+            return Choice::Existing(e.clone());
+        }
+        match slug(typed) {
+            Some(_) => Choice::New(typed.to_string()),
+            None => Choice::Nothing,
+        }
+    }
+}
+
 /// The one-shot floating dialog's state.
 #[derive(Debug, PartialEq, Default)]
 pub enum Dialog {
     /// waiting for permissions / the `ws.sh info` probe
     #[default]
     Probing,
-    /// create: typing the new workspace name
-    Prompt { info: WsInfo, input: String },
+    /// create: typing a name or picking an existing workspace
+    Prompt { info: WsInfo, prompt: Prompt },
     /// remove: waiting for y/N
     Confirm { info: WsInfo },
     /// the add/remove command is running
@@ -218,5 +321,88 @@ mod tests {
         let kdl = keybind_kdl(r#"file:/p/we"ird.wasm"#, "Alt w", "Alt W").unwrap();
         let config = zellij_utils::input::config::Config::from_kdl(&kdl, None);
         assert!(config.is_ok(), "{:?}\n{}", config.err(), kdl);
+    }
+
+    fn prompt(names: &[&str]) -> Prompt {
+        Prompt {
+            existing: names
+                .iter()
+                .map(|n| Existing { name: n.to_string(), root: format!("/c/p.ws/{}", n) })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn names(p: &Prompt) -> Vec<&str> {
+        p.matches().iter().map(|e| e.name.as_str()).collect()
+    }
+
+    #[test]
+    fn parse_list_reads_name_root_lines() {
+        assert_eq!(
+            parse_list("feat\t/c/p.ws/feat\n\tjunk\nfix\t/c/p.ws/fix\n"),
+            vec![
+                Existing { name: "feat".into(), root: "/c/p.ws/feat".into() },
+                Existing { name: "fix".into(), root: "/c/p.ws/fix".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_filter_by_case_insensitive_substring() {
+        let mut p = prompt(&["feat-x", "Fix-y", "docs"]);
+        assert_eq!(names(&p), ["feat-x", "Fix-y", "docs"]);
+        p.type_char('f');
+        p.type_char('I');
+        assert_eq!(names(&p), ["Fix-y"]);
+    }
+
+    #[test]
+    fn selection_moves_within_matches_and_back_to_typed_name() {
+        let mut p = prompt(&["a", "b"]);
+        p.move_selection(-1);
+        assert_eq!(p.selected, None);
+        p.move_selection(1);
+        p.move_selection(1);
+        p.move_selection(1);
+        assert_eq!(p.selected, Some(1)); // clamped to the last match
+        p.move_selection(-1);
+        p.move_selection(-1);
+        assert_eq!(p.selected, None);
+        // typing drops a selection that may no longer be among the matches
+        p.move_selection(1);
+        p.type_char('b');
+        assert_eq!(p.selected, None);
+        assert_eq!(prompt(&[]).matches().len(), 0);
+    }
+
+    #[test]
+    fn choice_prefers_selection_then_exact_name_then_new() {
+        let mut p = prompt(&["feat-x", "fix"]);
+        p.move_selection(1);
+        p.move_selection(1);
+        assert_eq!(p.choice(), Choice::Existing(p.existing[1].clone()));
+
+        let mut p = prompt(&["feat-x", "fix"]);
+        for c in "fix".chars() {
+            p.type_char(c);
+        }
+        assert_eq!(p.choice(), Choice::Existing(p.existing[1].clone()));
+        p.type_char('2');
+        assert_eq!(p.choice(), Choice::New("fix2".into()));
+        assert_eq!(prompt(&[]).choice(), Choice::Nothing);
+    }
+
+    #[test]
+    fn complete_fills_in_selected_or_first_match() {
+        let mut p = prompt(&["feat-x", "feat-y"]);
+        p.type_char('f');
+        p.complete();
+        assert_eq!(p.input, "feat-x");
+        let mut p = prompt(&["feat-x", "feat-y"]);
+        p.move_selection(1);
+        p.move_selection(1);
+        p.complete();
+        assert_eq!((p.input.as_str(), p.selected), ("feat-y", None));
     }
 }
