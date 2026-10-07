@@ -24,11 +24,16 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
 - **`Alt w`: new workspace** for the focused pane's repository. Asks for a name,
   creates it next to the main checkout in `<project>.ws/<name>` (jj: `jj workspace
   add`; git: `git worktree add`, new branch `<name>` unless it exists, `/` in the name
-  becomes `-` in the directory) and opens it in a new tab.
+  becomes `-` in the directory) and opens it in a new tab. The name of an existing
+  workspace opens it again.
 - **`Alt W`: remove the focused tab's workspace** after a `y` confirmation and close the
   tab. jj: the workspace is snapshotted and forgotten, its changes stay in the repo, the
   directory is deleted. git: `git worktree remove`, which refuses if the worktree has
   changes. The main checkout is never removed.
+- **Closing tabs works as without the sidebar.** When the last pane of a tab exits, the
+  tab closes; when that was the last tab, the session ends. Closing a tab keeps its
+  workspace on disk (reopen it with `Alt w`), and a group disappears from the sidebar
+  with its last tab.
 - **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
   `zellij pipe`, e.g. from Claude Code hooks.
 

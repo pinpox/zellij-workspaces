@@ -7,17 +7,15 @@
 #
 #   info              print "<vcs>\t<main root>\t<workspace root>\t<workspace name>"
 #                     for DIR; exit 3 when DIR is not in a jj or git repository
-#   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME)
+#   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME);
+#                     succeeds without changes if PATH already is a workspace of
+#                     this repository, so the plugin just opens it again
 #   remove VCS ROOT NAME
 #                     jj: forget workspace NAME (its changes stay in the repo) and
 #                     delete ROOT; git: `git worktree remove ROOT` (refuses if dirty)
 set -eu
 
-cd "$1"
-cmd=$2
-shift 2
-case $cmd in
-info)
+info() {
   if root=$(jj workspace root --ignore-working-copy 2>/dev/null); then
     # The main checkout holds the repo store in .jj/repo; other workspaces
     # have a file there pointing at it (relative to their .jj). Not using
@@ -38,11 +36,30 @@ info)
     if [ "$root" = "$main" ]; then name=main; else name=$(basename "$root"); fi
     printf 'git\t%s\t%s\t%s\n' "$main" "$root" "$name"
   else
-    exit 3
+    return 3
   fi
+}
+
+cd "$1"
+cmd=$2
+shift 2
+case $cmd in
+info)
+  info
   ;;
 add)
   vcs=$1 dir=$2 name=$3
+  if [ -e "$dir" ]; then
+    # reopening a workspace whose tab was closed
+    here=$(info | cut -f2)
+    if there=$(cd "$dir" && info) &&
+      [ "$(echo "$there" | cut -f2)" = "$here" ] &&
+      [ "$(echo "$there" | cut -f3)" = "$dir" ]; then
+      exit 0
+    fi
+    echo "$dir already exists and is not a workspace of this repository" >&2
+    exit 1
+  fi
   mkdir -p "$(dirname "$dir")"
   if [ "$vcs" = jj ]; then
     jj workspace add --name "$(basename "$dir")" "$dir"

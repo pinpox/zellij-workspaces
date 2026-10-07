@@ -127,6 +127,39 @@ fn jj_main_checkout_found_when_no_workspace_is_named_default() {
 }
 
 #[test]
+fn add_reopens_an_existing_workspace_and_refuses_foreign_directories() {
+    let sb = Sandbox::new("reopen");
+    let jj_main = sb.dir.join("proj");
+    sb.run("jj", &["git", "init", "proj"], &sb.dir);
+    let git_main = sb.dir.join("gproj");
+    sb.run("git", &["init", "-q", "gproj"], &sb.dir);
+    sb.run("git", &["commit", "-q", "--allow-empty", "-m", "init"], &git_main);
+
+    for (vcs, main) in [("jj", &jj_main), ("git", &git_main)] {
+        let ws = main.with_extension("ws");
+        let dir = ws.join("feat");
+        let first = sb.ws(&["add", vcs, &s(&dir), "feat"], main);
+        assert!(first.status.success(), "{} add: {}", vcs, stderr(&first));
+        fs::write(dir.join("kept"), "x").unwrap();
+
+        let again = sb.ws(&["add", vcs, &s(&dir), "feat"], main);
+        assert!(again.status.success(), "{} reopen: {}", vcs, stderr(&again));
+        assert!(dir.join("kept").exists(), "{}: reopen touched the workspace", vcs);
+
+        // an unrelated directory at the target path is not adopted
+        let foreign = ws.join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        let out = sb.ws(&["add", vcs, &s(&foreign), "foreign"], main);
+        assert!(!out.status.success(), "{}: adopted a foreign directory", vcs);
+    }
+
+    let list = sb.run("jj", &["workspace", "list", "-T", "name ++ \"\\n\""], &jj_main);
+    assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 2);
+    let wt = sb.run("git", &["worktree", "list"], &git_main);
+    assert_eq!(String::from_utf8_lossy(&wt.stdout).lines().count(), 2);
+}
+
+#[test]
 fn git_worktree_add_info_remove() {
     let sb = Sandbox::new("git");
     let main = sb.dir.join("proj");

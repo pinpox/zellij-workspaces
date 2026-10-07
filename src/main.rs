@@ -80,6 +80,24 @@ fn is_default_tab_name(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyTab {
+    Close,
+    Quit,
+}
+
+/// What to do about the sidebar's own tab, given whether it ever had other
+/// panes, how many it has now, and how many tabs the session has.
+fn empty_tab_action(had_content: bool, others: usize, tabs: usize) -> Option<EmptyTab> {
+    if !had_content || others > 0 {
+        None
+    } else if tabs <= 1 {
+        Some(EmptyTab::Quit)
+    } else {
+        Some(EmptyTab::Close)
+    }
+}
+
 /// Rollup priority for collapsed group headers: waiting > working > completed.
 fn merge(acc: Option<Attention>, x: Attention) -> Attention {
     match (acc, x) {
@@ -231,6 +249,13 @@ struct State {
     own_url: Option<String>,
     /// tiled terminal panes of the own tab, in manifest order
     own_terminal_panes: Vec<u32>,
+    /// panes in the own tab besides this sidebar, as of the last PaneUpdate
+    own_tab_others: usize,
+    /// the own tab has had other panes (a fresh tab may report the sidebar
+    /// before its terminal exists)
+    own_tab_had_content: bool,
+    /// close/quit already requested for the own tab
+    closing: bool,
     granted: bool,
     keys_bound: bool,
     new_key: String,
@@ -554,9 +579,8 @@ impl State {
                 }
             }
         }
-        self.own_terminal_panes = self
-            .own_tab
-            .and_then(|pos| manifest.panes.get(&pos))
+        let own_panes = self.own_tab.and_then(|pos| manifest.panes.get(&pos));
+        self.own_terminal_panes = own_panes
             .map(|panes| {
                 panes
                     .iter()
@@ -565,6 +589,50 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
+        // like zellij's own "tab is empty" rule: unselectable panes (status
+        // bar, tab bar) don't keep a tab open, nor do hidden helper plugins
+        // (`zellij:link` sits suppressed in the first tab). Suppressed
+        // terminals do count: zellij restores them when their replacement closes.
+        self.own_tab_others = own_panes
+            .map(|panes| {
+                panes
+                    .iter()
+                    .filter(|p| {
+                        p.is_selectable
+                            && !(p.is_plugin && (p.id == self.plugin_id || p.is_suppressed))
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        if self.own_tab_others > 0 {
+            self.own_tab_had_content = true;
+        }
+    }
+
+    /// The sidebar keeps its tab alive after the last real pane is gone, which
+    /// zellij would otherwise close: close the tab, or end the session when it
+    /// is the last one, like zellij does when the last pane exits. The
+    /// workspace on disk is untouched; Alt w with its name reopens it.
+    fn close_if_empty(&mut self) {
+        if self.closing {
+            return;
+        }
+        match empty_tab_action(self.own_tab_had_content, self.own_tab_others, self.tabs.len()) {
+            Some(EmptyTab::Quit) => {
+                if let Some(path) = self.state_file() {
+                    let _ = std::fs::remove_file(path);
+                }
+                self.closing = true;
+                quit_zellij();
+            }
+            Some(EmptyTab::Close) => {
+                if let Some(tab_id) = self.own_tab_id() {
+                    self.closing = true;
+                    close_tab_with_id(tab_id as u64);
+                }
+            }
+            None => {}
+        }
     }
 
     fn own_tab_id(&self) -> Option<usize> {
@@ -993,7 +1061,7 @@ impl State {
         let text = match &self.dialog {
             Dialog::Probing => "…".to_string(),
             Dialog::Prompt { info, input } => format!(
-                "New workspace for {}\n\nname: {}▏\n\n\u{1b}[2mEnter create · Esc cancel\u{1b}[0m",
+                "Workspace for {}\n\nname: {}▏\n\n\u{1b}[2mEnter create, or open an existing one · Esc cancel\u{1b}[0m",
                 info.project(),
                 input
             ),
@@ -1130,6 +1198,7 @@ impl ZellijPlugin for State {
                 self.update_panes(&manifest);
                 self.bind_keys();
                 self.probe_default_tab();
+                self.close_if_empty();
                 false
             }
             // Every sidebar instance gets every cwd change; only the one in
@@ -1392,6 +1461,15 @@ mod tests {
         assert!(!move_in(&mut order, "b", 1)); // already last
         assert!(!move_in(&mut order, "missing", 1));
         assert_eq!(order, vec!["a", "c", "b"]); // edges/missing leave order untouched
+    }
+
+    #[test]
+    fn empty_tab_closes_or_quits_only_after_its_panes_are_gone() {
+        // a fresh tab may list only the sidebar before its terminal exists
+        assert_eq!(empty_tab_action(false, 0, 3), None);
+        assert_eq!(empty_tab_action(true, 1, 3), None);
+        assert_eq!(empty_tab_action(true, 0, 3), Some(EmptyTab::Close));
+        assert_eq!(empty_tab_action(true, 0, 1), Some(EmptyTab::Quit));
     }
 
     #[test]
