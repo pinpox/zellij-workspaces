@@ -7,8 +7,8 @@ mod workspace;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use workspace::{
-    keybind_kdl, parse_info, parse_list, run_ws, slug, workspace_dir, Choice, Dialog, Prompt,
-    WsInfo, NOT_A_REPO,
+    keybind_kdl, parse_info, parse_list, run_ws, slug, toggle_kdl, workspace_dir, Choice, Dialog,
+    Prompt, WsInfo, NOT_A_REPO,
 };
 use zellij_tile::prelude::*;
 
@@ -111,16 +111,18 @@ fn merge(acc: Option<Attention>, x: Attention) -> Attention {
 /// Persisted sidebar state: group display order, collapsed groups, and — only
 /// for groups the user explicitly reordered tabs in — per-group tab label order.
 /// Groups absent from `tab_order` keep following Zellij's native tab positions.
+/// `hidden`: the sidebar is collapsed out of the layout (toggle key), in every tab.
 #[derive(Default, PartialEq, Debug)]
 struct Persisted {
     order: Vec<String>,
     collapsed: BTreeSet<String>,
     tab_order: BTreeMap<String, Vec<String>>,
+    hidden: bool,
 }
 
 /// One line per entry: `order <group>` / `collapsed <group>` /
-/// `taborder <group>\t<label>` (labels of one group in order, one per line).
-/// Names may contain anything but a newline (and, for groups, a tab).
+/// `taborder <group>\t<label>` (labels of one group in order, one per line) /
+/// `hidden`. Names may contain anything but a newline (and, for groups, a tab).
 /// Unknown lines are ignored.
 fn parse_state(s: &str) -> Persisted {
     let mut p = Persisted::default();
@@ -136,6 +138,8 @@ fn parse_state(s: &str) -> Persisted {
                     .or_default()
                     .push(label.to_string());
             }
+        } else if line == "hidden" {
+            p.hidden = true;
         }
     }
     p
@@ -161,6 +165,9 @@ fn serialize_state(p: &Persisted) -> String {
             out.push_str(label);
             out.push('\n');
         }
+    }
+    if p.hidden {
+        out.push_str("hidden\n");
     }
     out
 }
@@ -261,6 +268,13 @@ struct State {
     keys_bound: bool,
     new_key: String,
     close_key: String,
+    toggle_key: String,
+    /// sidebar collapsed out of the layout in every tab (persisted, shared)
+    hidden: bool,
+    /// what this instance last asked zellij for, to only call it on changes
+    collapsed_applied: Option<bool>,
+    /// this instance's tab was the active one at the last TabUpdate
+    was_active: bool,
     /// tab id whose default "Tab #N" name was already probed
     probed_tab: Option<usize>,
     dialog: Dialog,
@@ -340,6 +354,7 @@ impl State {
             self.group_order = p.order;
             self.collapsed = p.collapsed;
             self.tab_order = p.tab_order;
+            self.hidden = p.hidden;
         }
     }
 
@@ -351,6 +366,7 @@ impl State {
             order: self.display_group_order(),
             collapsed: self.collapsed.clone(),
             tab_order: self.tab_order.clone(),
+            hidden: self.hidden,
         };
         let _ = std::fs::write(path, serialize_state(&p));
     }
@@ -639,6 +655,35 @@ impl State {
     fn own_tab_id(&self) -> Option<usize> {
         let pos = self.own_tab?;
         self.tabs.iter().find(|t| t.position == pos).map(|t| t.tab_id)
+    }
+
+    fn own_tab_is_active(&self) -> bool {
+        self.own_tab
+            .is_some_and(|pos| self.tabs.iter().any(|t| t.position == pos && t.active))
+    }
+
+    /// Collapse or expand this instance's pane to match the shared `hidden` flag.
+    /// Collapsing keeps the pane's place in the layout, so expanding brings it
+    /// back where it was, at its width.
+    fn apply_hidden(&mut self) {
+        if self.granted && self.collapsed_applied != Some(self.hidden) {
+            set_self_collapsed(self.hidden);
+            self.collapsed_applied = Some(self.hidden);
+        }
+    }
+
+    /// The toggle key goes to a single instance by id, so it has to be the one in
+    /// the tab on screen: rebind it each time this instance's tab becomes active.
+    fn bind_toggle_key(&mut self) {
+        let active = self.own_tab_is_active();
+        if !active {
+            self.was_active = false;
+        } else if !self.was_active && self.granted {
+            if let Some(kdl) = toggle_kdl(&self.toggle_key, self.plugin_id) {
+                reconfigure(kdl, false);
+            }
+            self.was_active = true;
+        }
     }
 
     /// Strip a *seen* attention marker from the tab at `pos` (global rename).
@@ -1168,6 +1213,10 @@ impl ZellijPlugin for State {
             .get("close_key")
             .cloned()
             .unwrap_or_else(|| "Alt W".to_string());
+        self.toggle_key = configuration
+            .get("toggle_key")
+            .cloned()
+            .unwrap_or_else(|| "Alt s".to_string());
         self.mode = match configuration.get("mode").map(String::as_str) {
             Some("new") => Mode::New,
             Some("close") => Mode::Close,
@@ -1202,6 +1251,8 @@ impl ZellijPlugin for State {
             Event::PermissionRequestResult(status) => {
                 self.granted = status == PermissionStatus::Granted;
                 self.bind_keys();
+                self.bind_toggle_key();
+                self.apply_hidden();
                 self.probe_default_tab();
                 false
             }
@@ -1234,6 +1285,9 @@ impl ZellijPlugin for State {
                     }
                 }
                 self.ensure_timer();
+                // another tab's instance may have toggled the sidebar in the meantime
+                self.apply_hidden();
+                self.bind_toggle_key();
                 self.probe_default_tab();
                 true
             }
@@ -1287,6 +1341,12 @@ impl ZellijPlugin for State {
     fn pipe(&mut self, pipe_message: PipeMessage) -> bool {
         if self.mode != Mode::Sidebar {
             return false;
+        }
+        if pipe_message.name == workspace::TOGGLE_MESSAGE {
+            self.hidden = !self.hidden;
+            self.save_state();
+            self.apply_hidden();
+            return true;
         }
         let Some(rest) = pipe_message.name.strip_prefix("zellij-workspaces::") else {
             return false;
@@ -1474,6 +1534,7 @@ mod tests {
                 vec!["db".to_string(), "api".to_string()],
             )]
             .into(),
+            hidden: true,
         };
         assert_eq!(parse_state(&serialize_state(&p)), p);
         assert_eq!(parse_state(""), Persisted::default());

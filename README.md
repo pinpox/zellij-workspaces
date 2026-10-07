@@ -44,6 +44,9 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
   tab closes; when that was the last tab, the session ends. Closing a tab keeps its
   workspace on disk (reopen it with `Alt w`), and a group disappears from the sidebar
   with its last tab.
+- **`Alt s`: hide or show the sidebar** in every tab. Hidden, it gives its columns to
+  the panes next to it; shown again, it comes back in its place at its width, also after
+  the terminal was resized.
 - **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
   `zellij pipe`, e.g. from Claude Code hooks.
 
@@ -52,8 +55,11 @@ Built on [zellij-vtabs](https://github.com/otezz/zellij-vtabs) by Seto Kuslakson
 
 ## Requirements
 
-- Zellij 0.44.2 or newer (the plugin is built against `zellij-tile` 0.44.2; builds
-  against an older `zellij-tile` load on newer Zellij, not the other way round)
+- A Zellij with `set_self_collapsed` ([#5590](https://github.com/zellij-org/zellij/pull/5590),
+  unreleased): this branch builds against `zellij-tile` from Zellij's main branch, and a
+  plugin built against a newer `zellij-tile` than the running Zellij does not load.
+  Restoring the sidebar after a resize while hidden also needs the fix in branch
+  `fix/collapsed-pane-rejoins-in-place`.
 - `sh` and `jj` and/or `git` on the `PATH` of the Zellij server
 
 ## Install
@@ -111,6 +117,7 @@ In the layout's `plugin` block (defaults shown):
 plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
     new_key "Alt w"        // "" disables
     close_key "Alt W"      // "" disables
+    toggle_key "Alt s"     // hide/show the sidebar, "" disables
     separator ":"          // project<separator>workspace
     waiting_icon "◆"       // rendered yellow
     completed_icon "✓"     // rendered green

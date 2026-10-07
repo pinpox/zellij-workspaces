@@ -99,6 +99,24 @@ pub fn keybind_kdl(plugin_url: &str, new_key: &str, close_key: &str) -> Option<S
     ))
 }
 
+/// Pipe message the toggle key sends to the sidebar instance on screen.
+pub const TOGGLE_MESSAGE: &str = "zellij-workspaces-toggle";
+
+/// Keybinding sending `TOGGLE_MESSAGE` to one plugin instance by id. By id
+/// rather than URL: a URL message goes to every instance with a matching
+/// configuration, or starts a new one when none matches.
+pub fn toggle_kdl(key: &str, plugin_id: u32) -> Option<String> {
+    if key.trim().is_empty() {
+        return None;
+    }
+    Some(format!(
+        "keybinds {{\n    shared_except \"locked\" {{\n        bind \"{}\" {{ MessagePluginId {} {{ name \"{}\"; }}; }}\n    }}\n}}\n",
+        kdl_escape(key),
+        plugin_id,
+        TOGGLE_MESSAGE
+    ))
+}
+
 fn kdl_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -321,6 +339,29 @@ mod tests {
         let kdl = keybind_kdl(r#"file:/p/we"ird.wasm"#, "Alt w", "Alt W").unwrap();
         let config = zellij_utils::input::config::Config::from_kdl(&kdl, None);
         assert!(config.is_ok(), "{:?}\n{}", config.err(), kdl);
+    }
+
+    #[test]
+    fn toggle_kdl_binds_the_key_to_one_instance_by_id() {
+        use zellij_utils::data::{BareKey, InputMode, KeyWithModifier};
+        use zellij_utils::input::actions::Action;
+        let kdl = toggle_kdl("Alt s", 7).unwrap();
+        let config = zellij_utils::input::config::Config::from_kdl(&kdl, None).unwrap();
+        let key = KeyWithModifier::new(BareKey::Char('s')).with_alt_modifier();
+        let actions = config
+            .keybinds
+            .get_actions_for_key_in_mode(&InputMode::Normal, &key)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::KeybindPipe { plugin_id: Some(7), name: Some(n), .. }] if n == TOGGLE_MESSAGE
+            ),
+            "{:?}",
+            actions
+        );
+        assert_eq!(toggle_kdl(" ", 7), None);
     }
 
     fn prompt(names: &[&str]) -> Prompt {

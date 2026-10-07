@@ -6,11 +6,13 @@ description = "Zellij sidebar: tabs grouped by project, with jj workspace / git 
 license = "MIT"
 
 [dependencies]
-zellij-tile = "=0.44.2"
+# unreleased: needs `set_self_collapsed` (zellij-org/zellij#5590); a plugin built
+# against a newer zellij-tile than the running zellij does not load
+zellij-tile = { git = "https://github.com/zellij-org/zellij", rev = "52710dcc418925433bbb7fdb2ba6b52e598e3b2f" }
 
 [dev-dependencies]
 # parse generated keybinding KDL with zellij's own config parser
-zellij-utils = "=0.44.2"
+zellij-utils = { git = "https://github.com/zellij-org/zellij", rev = "52710dcc418925433bbb7fdb2ba6b52e598e3b2f" }
 
 [profile.release]
 opt-level = "s"
