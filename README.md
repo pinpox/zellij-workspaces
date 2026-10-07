@@ -43,7 +43,12 @@ Built on [zellij-vtabs](https://github.com/otezz/zellij-vtabs) by Seto Kuslakson
 
 ## Install
 
-With Nix:
+Load the plugin from a fixed path such as `~/.config/zellij/plugins/zellij-workspaces.wasm`.
+Zellij remembers granted permissions by that path (symlinks are not resolved), so a
+fixed path keeps the grant across updates.
+
+With Nix, build it and link the result to that path, e.g. with home-manager's
+`xdg.configFile."zellij/plugins/zellij-workspaces.wasm".source`:
 
 ```sh
 nix build github:pinpox/zellij-workspaces
@@ -65,10 +70,10 @@ the first tab ends up without a terminal pane.
 
 ### Permissions
 
-On first start Zellij asks to grant `ReadApplicationState`, `ChangeApplicationState`,
-`ReadCliPipes`, `RunCommands` and `Reconfigure`. The prompt is cramped in a narrow
-sidebar; you can pre-grant instead in `~/.cache/zellij/permissions.kdl`, keyed by the
-plugin's absolute path:
+On first start the sidebar asks for `ReadApplicationState`, `ChangeApplicationState`,
+`ReadCliPipes`, `RunCommands` and `Reconfigure`. Focus the sidebar (`Alt h` from the
+pane next to it) and press `y`. Zellij stores the grant in
+`~/.cache/zellij/permissions.kdl`; writing that entry yourself works too:
 
 ```kdl
 "/home/you/.config/zellij/plugins/zellij-workspaces.wasm" {
