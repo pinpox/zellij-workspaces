@@ -532,9 +532,10 @@ impl State {
     }
 
     /// Add an attention marker to the tab containing `pane_id` (global rename).
-    fn set_attention(&self, pane_id: u32, attention: Attention) {
+    /// The setters return false when that tab is not known (yet).
+    fn set_attention(&self, pane_id: u32, attention: Attention) -> bool {
         let Some(t) = self.fresh_tab(pane_id) else {
-            return;
+            return false;
         };
         let (att, base) = parse_attention(&t.name);
         // Never mark the tab you're already looking at — you don't need an
@@ -544,37 +545,41 @@ impl State {
             if att == Some(Attention::Working) {
                 rename_tab_with_id(t.tab_id as u64, base.to_string());
             }
-            return;
+            return true;
         }
-        if att == Some(attention) {
-            return;
+        if att != Some(attention) {
+            rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, marker_of(attention)));
         }
-        rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, marker_of(attention)));
+        true
     }
 
     /// Mark the tab containing `pane_id` as working. Unlike attention marks
     /// this applies to the active tab too (it is not cleared on focus, so
     /// there is no set/clear race — only pipes ever end it).
-    fn set_working(&self, pane_id: u32) {
-        if let Some(t) = self.fresh_tab(pane_id) {
-            let (att, base) = parse_attention(&t.name);
-            if att != Some(Attention::Working) {
-                rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, MARK_WORKING));
-            }
+    fn set_working(&self, pane_id: u32) -> bool {
+        let Some(t) = self.fresh_tab(pane_id) else {
+            return false;
+        };
+        let (att, base) = parse_attention(&t.name);
+        if att != Some(Attention::Working) {
+            rename_tab_with_id(t.tab_id as u64, format!("{}{}", base, MARK_WORKING));
         }
+        true
     }
 
     /// Strip a working marker (Claude exited without a Stop) — attention marks stay.
-    fn clear_working(&self, pane_id: u32) {
-        if let Some(t) = self.fresh_tab(pane_id) {
-            let (att, base) = parse_attention(&t.name);
-            if att == Some(Attention::Working) {
-                rename_tab_with_id(t.tab_id as u64, base.to_string());
-            }
+    fn clear_working(&self, pane_id: u32) -> bool {
+        let Some(t) = self.fresh_tab(pane_id) else {
+            return false;
+        };
+        let (att, base) = parse_attention(&t.name);
+        if att == Some(Attention::Working) {
+            rename_tab_with_id(t.tab_id as u64, base.to_string());
         }
+        true
     }
 
-    fn apply_signal(&self, pane_id: u32, signal: Signal) {
+    fn apply_signal(&self, pane_id: u32, signal: Signal) -> bool {
         match signal {
             Signal::Waiting => self.set_attention(pane_id, Attention::Waiting),
             Signal::Completed => self.set_attention(pane_id, Attention::Completed),
@@ -601,19 +606,36 @@ impl State {
         for panes in by_tab.values() {
             let mut prev = None;
             let mut now = None;
+            let mut seen = Vec::new();
             for (pane, title) in panes {
                 if let Some(&s) = self.agents.get(pane) {
                     prev = prev.max(Some((s, *pane)));
                 }
                 if let Some(s) = parse_agent_title(title) {
-                    agents.insert(*pane, s);
+                    seen.push((*pane, s));
                     now = now.max(Some((s, *pane)));
                 }
             }
             let pane = now.or(prev).map(|(_, p)| p);
-            let signal = agent_signal(prev.map(|(s, _)| s), now.map(|(s, _)| s));
-            if let (Some(signal), Some(pane)) = (signal, pane) {
-                self.apply_signal(pane, signal);
+            // working and waiting are kept up on every read, not just on a
+            // change: a marker lost to a rename (or set before the tab list
+            // arrived after a reload) comes back; the setters are no-ops
+            // while it is in place
+            let signal = agent_signal(prev.map(|(s, _)| s), now.map(|(s, _)| s)).or(match now {
+                Some((AgentTitle::Working, _)) => Some(Signal::Working),
+                Some((AgentTitle::Attention, _)) => Some(Signal::Waiting),
+                _ => None,
+            });
+            let applied = match (signal, pane) {
+                (Some(signal), Some(pane)) => self.apply_signal(pane, signal),
+                _ => true,
+            };
+            if applied {
+                agents.extend(seen);
+            } else {
+                // e.g. the tab list has not arrived yet after a (re)load:
+                // keep the old states so the change is retried
+                agents.extend(panes.iter().filter_map(|(p, _)| self.agents.get(p).map(|&s| (*p, s))));
             }
         }
         self.agents = agents;
@@ -1360,11 +1382,8 @@ impl ZellijPlugin for State {
                 if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
                     self.clear_tab(pos);
                 }
-                // An agent still waiting for input is marked again once you
-                // leave its tab without answering.
-                for (&pane, _) in self.agents.iter().filter(|(_, s)| **s == AgentTitle::Attention) {
-                    self.set_attention(pane, Attention::Waiting);
-                }
+                // An agent still waiting for input is marked again by the next
+                // title read once you leave its tab without answering.
                 if let Some(i) = self.active_row_index() {
                     self.selected = i;
                 } else {
