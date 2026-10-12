@@ -86,6 +86,13 @@ complete one; copy it to `~/.config/zellij/layouts/` and set
 gets the sidebar. Use a plain base layout as in that file: with `default_tab_template`
 the first tab ends up without a terminal pane.
 
+Running sessions keep the plugin they loaded. After an update, reload it in each session
+(new sessions load the new one anyway):
+
+```sh
+zellij action start-or-reload-plugin file:~/.config/zellij/plugins/zellij-workspaces.wasm
+```
+
 ### Permissions
 
 On first start the sidebar asks for `ReadApplicationState`, `ChangeApplicationState`,

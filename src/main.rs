@@ -1306,13 +1306,8 @@ impl ZellijPlugin for State {
             _ => Mode::Sidebar,
         };
         self.plugin_id = get_plugin_ids().plugin_id;
-        request_permission(&[
-            PermissionType::ReadApplicationState,
-            PermissionType::ChangeApplicationState,
-            PermissionType::ReadCliPipes,
-            PermissionType::RunCommands,
-            PermissionType::Reconfigure,
-        ]);
+        // subscribe first: a reloaded plugin with permissions granted earlier
+        // gets its PermissionRequestResult right away
         subscribe(&[
             EventType::ModeUpdate,
             EventType::TabUpdate,
@@ -1323,6 +1318,13 @@ impl ZellijPlugin for State {
             EventType::CwdChanged,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
+        ]);
+        request_permission(&[
+            PermissionType::ReadApplicationState,
+            PermissionType::ChangeApplicationState,
+            PermissionType::ReadCliPipes,
+            PermissionType::RunCommands,
+            PermissionType::Reconfigure,
         ]);
     }
 
