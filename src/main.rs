@@ -33,6 +33,8 @@ const MARK_WORKING: &str = " ⚙";
 /// config key (each char = one frame; width-1 glyphs only).
 const SPINNER_DEFAULT: &str = "⣾⣽⣻⢿⡿⣟⣯⣷";
 const SPINNER_INTERVAL: f64 = 0.15;
+/// How often agent terminal titles are read (see `poll_agents`).
+const POLL_INTERVAL: f64 = 1.0;
 
 /// Each char of the `spinner` config value is one animation frame.
 fn parse_spinner(config: Option<&String>) -> Vec<String> {
@@ -105,6 +107,67 @@ fn merge(acc: Option<Attention>, x: Attention) -> Attention {
         (Some(Attention::Waiting), _) | (_, Attention::Waiting) => Attention::Waiting,
         (Some(Attention::Working), _) | (_, Attention::Working) => Attention::Working,
         _ => Attention::Completed,
+    }
+}
+
+/// A marker change for the tab containing a pane: the `zellij pipe` signals,
+/// also derived from agent terminal titles.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Signal {
+    Waiting,
+    Working,
+    Completed,
+    ClearWorking,
+}
+
+fn parse_signal(s: &str) -> Option<Signal> {
+    match s {
+        "waiting" => Some(Signal::Waiting),
+        "working" => Some(Signal::Working),
+        "completed" => Some(Signal::Completed),
+        "clear-working" => Some(Signal::ClearWorking),
+        _ => None,
+    }
+}
+
+/// Agent run state read from a pane's terminal title. Ordered by priority
+/// for a tab with several agents.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum AgentTitle {
+    Idle,
+    Working,
+    Attention,
+}
+
+/// omp's terminal title with `tui.titleState` (on by default):
+/// `π <state>[ <session title>]`, where the state is `!` (needs input), `>`
+/// (idle) or a spinner frame (`:` on terminals with static titles) while it
+/// works. Without the state the title is `π` or `π: <session title>`.
+fn parse_agent_title(title: &str) -> Option<AgentTitle> {
+    let mut rest = title.strip_prefix("π ")?.chars();
+    let state = rest.next()?;
+    if !matches!(rest.next(), None | Some(' ')) {
+        return None;
+    }
+    Some(match state {
+        '!' => AgentTitle::Attention,
+        '>' => AgentTitle::Idle,
+        _ => AgentTitle::Working,
+    })
+}
+
+/// The marker change for a tab whose agent state went from `prev` to `now`
+/// (None: no agent title in the tab). Finishing work marks the tab done;
+/// an agent that is idle from the start, or stops after asking, does not.
+fn agent_signal(prev: Option<AgentTitle>, now: Option<AgentTitle>) -> Option<Signal> {
+    if prev == now {
+        return None;
+    }
+    match now {
+        Some(AgentTitle::Attention) => Some(Signal::Waiting),
+        Some(AgentTitle::Working) => Some(Signal::Working),
+        Some(AgentTitle::Idle) if prev == Some(AgentTitle::Working) => Some(Signal::Completed),
+        Some(AgentTitle::Idle) | None => prev.map(|_| Signal::ClearWorking),
     }
 }
 
@@ -271,6 +334,12 @@ struct State {
     spinner: Vec<String>,
     spin: usize,
     timer_running: bool,
+    /// interval of the scheduled timer, and time since titles were last read
+    timer_interval: f64,
+    since_poll: f64,
+    /// agent title state of each terminal pane showing one, as of the last
+    /// title read
+    agents: BTreeMap<u32, AgentTitle>,
 }
 
 enum RenameTarget {
@@ -417,16 +486,16 @@ impl State {
 
     fn icon(&self, att: Option<Attention>) -> String {
         match att {
-            Some(Attention::Waiting) => format!("\u{1b}[33m{}\u{1b}[39m ", self.waiting_icon),
+            Some(Attention::Waiting) => format!("\u{1b}[31m{}\u{1b}[39m ", self.waiting_icon),
             Some(Attention::Working) => {
                 let frame = self
                     .spinner
                     .get(self.spin % self.spinner.len().max(1))
                     .map(String::as_str)
                     .unwrap_or("⣾");
-                format!("\u{1b}[36m{}\u{1b}[39m ", frame)
+                format!("\u{1b}[33m{}\u{1b}[39m ", frame)
             }
-            Some(Attention::Completed) => format!("\u{1b}[32m{}\u{1b}[39m ", self.completed_icon),
+            Some(Attention::Completed) => format!("\u{1b}[36m{}\u{1b}[39m ", self.completed_icon),
             None => String::new(),
         }
     }
@@ -437,12 +506,15 @@ impl State {
             .any(|t| parse_attention(&t.name).0 == Some(Attention::Working))
     }
 
-    /// Arm the animation timer if something is working and none is scheduled.
+    /// Keep one timer running once permitted: at the spinner's rate while a
+    /// tab is working, else at the title poll's.
     fn ensure_timer(&mut self) {
-        if self.any_working() && !self.timer_running {
-            set_timeout(SPINNER_INTERVAL);
-            self.timer_running = true;
+        if self.timer_running || !self.granted {
+            return;
         }
+        self.timer_interval = if self.any_working() { SPINNER_INTERVAL } else { POLL_INTERVAL };
+        set_timeout(self.timer_interval);
+        self.timer_running = true;
     }
 
     /// Server-fresh info for the tab containing `pane_id`. Pipe-driven renames
@@ -500,6 +572,61 @@ impl State {
                 rename_tab_with_id(t.tab_id as u64, base.to_string());
             }
         }
+    }
+
+    fn apply_signal(&self, pane_id: u32, signal: Signal) {
+        match signal {
+            Signal::Waiting => self.set_attention(pane_id, Attention::Waiting),
+            Signal::Completed => self.set_attention(pane_id, Attention::Completed),
+            Signal::Working => self.set_working(pane_id),
+            Signal::ClearWorking => self.clear_working(pane_id),
+        }
+    }
+
+    /// Follow the agent states that terminal titles show (see
+    /// `parse_agent_title`), one state per tab: its strongest agent. Every
+    /// running instance handles every tab, because zellij starts the sidebar
+    /// of a tab opened in the background only once it is shown; the renames
+    /// are idempotent, as for pipes. `titles`: (tab position, pane, title) of
+    /// every terminal pane.
+    fn track_agents(&mut self, titles: Vec<(usize, u32, String)>) {
+        if !self.granted {
+            return;
+        }
+        let mut by_tab: BTreeMap<usize, Vec<(u32, String)>> = BTreeMap::new();
+        for (pos, pane, title) in titles {
+            by_tab.entry(pos).or_default().push((pane, title));
+        }
+        let mut agents = BTreeMap::new();
+        for panes in by_tab.values() {
+            let mut prev = None;
+            let mut now = None;
+            for (pane, title) in panes {
+                if let Some(&s) = self.agents.get(pane) {
+                    prev = prev.max(Some((s, *pane)));
+                }
+                if let Some(s) = parse_agent_title(title) {
+                    agents.insert(*pane, s);
+                    now = now.max(Some((s, *pane)));
+                }
+            }
+            let pane = now.or(prev).map(|(_, p)| p);
+            let signal = agent_signal(prev.map(|(s, _)| s), now.map(|(s, _)| s));
+            if let (Some(signal), Some(pane)) = (signal, pane) {
+                self.apply_signal(pane, signal);
+            }
+        }
+        self.agents = agents;
+    }
+
+    /// Title changes don't cause a PaneUpdate, so the timer reads them.
+    fn poll_agents(&mut self) {
+        let titles = self
+            .pane_tab
+            .iter()
+            .filter_map(|(&id, &pos)| get_pane_info(PaneId::Terminal(id)).map(|p| (pos, id, p.title)))
+            .collect();
+        self.track_agents(titles);
     }
 
     /// Ask the host which workspace `cwd` belongs to; the answer renames the
@@ -1208,6 +1335,7 @@ impl ZellijPlugin for State {
                 self.granted = status == PermissionStatus::Granted;
                 self.bind_keys();
                 self.probe_default_tab();
+                self.ensure_timer();
                 false
             }
             Event::ModeUpdate(mode_info) => {
@@ -1230,6 +1358,11 @@ impl ZellijPlugin for State {
                 if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
                     self.clear_tab(pos);
                 }
+                // An agent still waiting for input is marked again once you
+                // leave its tab without answering.
+                for (&pane, _) in self.agents.iter().filter(|(_, s)| **s == AgentTitle::Attention) {
+                    self.set_attention(pane, Attention::Waiting);
+                }
                 if let Some(i) = self.active_row_index() {
                     self.selected = i;
                 } else {
@@ -1244,16 +1377,28 @@ impl ZellijPlugin for State {
             }
             Event::Timer(_) => {
                 self.timer_running = false;
-                if self.any_working() {
-                    self.spin = self.spin.wrapping_add(1);
-                    self.ensure_timer();
-                    true
-                } else {
-                    false
+                self.since_poll += self.timer_interval;
+                if self.since_poll >= POLL_INTERVAL {
+                    self.since_poll = 0.0;
+                    self.poll_agents();
                 }
+                let working = self.any_working();
+                if working {
+                    self.spin = self.spin.wrapping_add(1);
+                }
+                self.ensure_timer();
+                working
             }
             Event::PaneUpdate(manifest) => {
                 self.update_panes(&manifest);
+                let titles = manifest
+                    .panes
+                    .iter()
+                    .flat_map(|(&pos, panes)| {
+                        panes.iter().filter(|p| !p.is_plugin).map(move |p| (pos, p.id, p.title.clone()))
+                    })
+                    .collect();
+                self.track_agents(titles);
                 self.bind_keys();
                 self.probe_default_tab();
                 self.close_if_empty();
@@ -1302,12 +1447,8 @@ impl ZellijPlugin for State {
         let Ok(pane_id) = pane_id.parse::<u32>() else {
             return false;
         };
-        match signal {
-            "waiting" => self.set_attention(pane_id, Attention::Waiting),
-            "completed" => self.set_attention(pane_id, Attention::Completed),
-            "working" => self.set_working(pane_id),
-            "clear-working" => self.clear_working(pane_id),
-            _ => {}
+        if let Some(signal) = parse_signal(signal) {
+            self.apply_signal(pane_id, signal);
         }
         false
     }
@@ -1528,6 +1669,34 @@ mod tests {
         assert_eq!(empty_tab_action(true, 1, 3), None);
         assert_eq!(empty_tab_action(true, 0, 3), Some(EmptyTab::Close));
         assert_eq!(empty_tab_action(true, 0, 1), Some(EmptyTab::Quit));
+    }
+
+    #[test]
+    fn omp_titles_parsed_into_agent_states() {
+        assert_eq!(parse_agent_title("π ⠙ Add agent skill"), Some(AgentTitle::Working));
+        assert_eq!(parse_agent_title("π : static host"), Some(AgentTitle::Working));
+        assert_eq!(parse_agent_title("π ! Announce events"), Some(AgentTitle::Attention));
+        assert_eq!(parse_agent_title("π > Improve alerts"), Some(AgentTitle::Idle));
+        assert_eq!(parse_agent_title("π >"), Some(AgentTitle::Idle)); // no session title yet
+        // titleState disabled, other programs
+        assert_eq!(parse_agent_title("π: Improve alerts"), None);
+        assert_eq!(parse_agent_title("π"), None);
+        assert_eq!(parse_agent_title("π pi.rs"), None);
+        assert_eq!(parse_agent_title("Pane #2"), None);
+    }
+
+    #[test]
+    fn agent_transitions_map_to_markers() {
+        use AgentTitle::*;
+        assert_eq!(agent_signal(None, Some(Working)), Some(Signal::Working));
+        assert_eq!(agent_signal(Some(Working), Some(Attention)), Some(Signal::Waiting));
+        assert_eq!(agent_signal(Some(Working), Some(Idle)), Some(Signal::Completed));
+        // nothing finished: started idle, or stopped after asking
+        assert_eq!(agent_signal(None, Some(Idle)), None);
+        assert_eq!(agent_signal(Some(Attention), Some(Idle)), Some(Signal::ClearWorking));
+        // agent gone (exited or title replaced)
+        assert_eq!(agent_signal(Some(Working), None), Some(Signal::ClearWorking));
+        assert_eq!(agent_signal(Some(Working), Some(Working)), None);
     }
 
     #[test]

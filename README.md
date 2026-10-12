@@ -44,8 +44,9 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
   tab closes; when that was the last tab, the session ends. Closing a tab keeps its
   workspace on disk (reopen it with `Alt w`), and a group disappears from the sidebar
   with its last tab.
-- **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
-  `zellij pipe`, e.g. from Claude Code hooks.
+- **Agent status icons** (red `◆` needs input, teal `✓` done, yellow spinner while
+  working), read from [omp](https://omp.sh)'s terminal titles with no
+  setup, or set over `zellij pipe`, e.g. from Claude Code hooks.
 - **`zellij-ws` CLI and Agent Skill** to create, rename and remove workspaces from
   scripts and coding agents, e.g. to spin off a task into its own workspace and tab.
 
@@ -114,8 +115,8 @@ plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
     new_key "Alt w"        // "" disables
     close_key "Alt W"      // "" disables
     separator ":"          // project<separator>workspace
-    waiting_icon "◆"       // rendered yellow
-    completed_icon "✓"     // rendered green
+    waiting_icon "◆"       // rendered red
+    completed_icon "✓"     // rendered teal
     spinner "⣾⣽⣻⢿⡿⣟⣯⣷"    // working animation, one width-1 char per frame
 }
 ```
@@ -167,10 +168,21 @@ the agent's skill directory, e.g. `~/.claude/skills/zellij-workspaces`.
 
 ## Agent status
 
-Send `zellij pipe --name "zellij-workspaces::<signal>::<pane_id>"` with `<signal>` one of
-`waiting`, `completed`, `working`, `clear-working`; the tab containing the pane gets the
-status. `waiting`/`completed` are never set on the tab you are looking at and are
-cleared when you switch to it; `working` stays until `waiting`, `completed` or
+Tabs running an agent get an icon in the sidebar: red `◆` while it waits for input, a
+yellow spinner while it works, and a teal `✓` once it finished. `◆` and `✓` are never
+set on the tab you are looking at and are cleared when you switch to it, but `◆` returns
+when you leave a tab whose agent is still waiting. A tab with several agents shows the
+most urgent state: waiting, then working, then done.
+
+**omp** needs no setup: with its default `tui.titleState`, omp titles its terminal
+`π <state> <session title>`, where the state is `!` (needs input), `>` (idle) or a
+spinner frame (working). The sidebar reads the titles of all panes once a second (title
+changes cause no plugin event) and marks a tab done when its agent goes from working to
+idle.
+
+Other agents send `zellij pipe --name "zellij-workspaces::<signal>::<pane_id>"` with
+`<signal>` one of `waiting`, `completed`, `working`, `clear-working`; the tab containing
+the pane gets the status. `working` stays until `waiting`, `completed` or
 `clear-working` arrives.
 
 The status is stored as a suffix on the tab name (` ⏳`, ` ✅`, ` ⚙`), the only state all
@@ -218,6 +230,9 @@ hangs) and `timeout 3` (no listening plugin, e.g. a session without this layout)
   `get_pane_cwd`. They run [`src/ws.sh`](src/ws.sh), embedded in the plugin, through
   `run_command` to ask jj/git which workspace a directory belongs to, then rename the
   tab with `rename_tab_with_id`.
+- **Agent titles** are read by every running sidebar instance for all tabs: zellij starts
+  the sidebar of a tab opened in the background only when it is first shown. The renames
+  that set and clear status suffixes are idempotent, so instances never conflict.
 - **The keybindings** are added with `reconfigure` as `LaunchPlugin` actions that start
   a floating instance of the same plugin with `mode "new"` or `mode "close"`. Zellij
   starts such a plugin in the focused pane's directory, which tells the dialog which
