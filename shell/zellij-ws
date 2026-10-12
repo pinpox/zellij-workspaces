@@ -18,6 +18,10 @@ Usage: zellij-ws COMMAND [ARGS]    (run inside a jj or git repository)
 
   list                      workspaces of the repository except the main checkout,
                             one "<name><TAB><root>" line each
+  status [NAME]             "<name><TAB><state><TAB><root>" for each workspace (or just
+                            NAME); state: working, needs-input, done (finished, tab not
+                            looked at since), open (tab open, nothing to report) or
+                            closed (no tab). Needs zellij
   new NAME [-- COMMAND...]  create workspace NAME next to the main checkout, or reopen
                             an existing one, and open it in a background tab running
                             COMMAND (default: a shell); prints the workspace root
@@ -88,6 +92,28 @@ case $cmd in
 list)
   [ $# -eq 0 ] || die "usage: zellij-ws list"
   ws "$root" list
+  ;;
+
+status)
+  [ $# -le 1 ] || die "usage: zellij-ws status [NAME]"
+  in_zellij || die "status needs zellij"
+  only=
+  [ $# -eq 0 ] || only=$(slug "$1")
+  tabs=$(zellij action list-tabs --json)
+  out=$(ws "$root" list | while IFS=$ht read -r name dir; do
+    [ -z "$only" ] || [ "$name" = "$only" ] || continue
+    # the sidebar keeps an agent's state as a marker on its tab name
+    state=$(printf %s "$tabs" | "$jq" -r --arg n "$project$sep$name" '
+      map(.name | select(sub(" (⏳|✅|⚙)$"; "") == $n)) | first
+      | if . == null then "closed"
+        elif endswith(" ⏳") then "needs-input"
+        elif endswith(" ⚙") then "working"
+        elif endswith(" ✅") then "done"
+        else "open" end')
+    printf '%s\t%s\t%s\n' "$name" "$state" "$dir"
+  done)
+  [ -z "$only" ] || [ -n "$out" ] || die "no workspace $only in $project"
+  [ -z "$out" ] || printf '%s\n' "$out"
   ;;
 
 new)

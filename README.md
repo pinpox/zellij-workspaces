@@ -152,6 +152,8 @@ The Nix package also installs `zellij-ws`, which does from a shell what `Alt w` 
 
 ```sh
 zellij-ws list                       # "<name>\t<root>" per workspace, main checkout excluded
+zellij-ws status [NAME]              # per workspace "<name>\t<state>\t<root>", state from the
+                                     # sidebar: working, needs-input, done, open or closed
 zellij-ws new NAME [-- CMD...]       # create or reopen NAME, open it in a background tab
                                      # running CMD (default: a shell); prints its root
 zellij-ws rename [OLD] NEW           # rename OLD (default: the current workspace) and its tab
@@ -168,9 +170,11 @@ zellij-ws close NAME                 # remove NAME like Alt W and close its tab
   `separator` (`:`) and needs `jj`/`git` and the session's `zellij` on `PATH`.
 
 `share/skills/zellij-workspaces/SKILL.md` is an [Agent Skill](https://agentskills.io)
-teaching coding agents to use `zellij-ws`: spin off independent work into its own
-workspace, optionally started with another agent (`zellij-ws new fix-x -- claude "…"`),
-rename a workspace they take over, and close workspaces only once asked to. Link it into
+teaching coding agents to use `zellij-ws`: start tasks for you in their own workspaces,
+optionally with an agent that gets each going (`zellij-ws new fix-x -- claude "…"`), report
+their status, rename a workspace they take over, and close workspaces only once asked
+to. Agents do their own implementation work with their own subagents, not in these
+workspaces, and never type into the agents running there. Link it into
 the agent's skill directory, e.g. `~/.claude/skills/zellij-workspaces`.
 
 ## Agent status

@@ -1,6 +1,6 @@
 ---
 name: zellij-workspaces
-description: Spin off work into its own jj workspace or git worktree with its own zellij tab, optionally running another agent there, and rename or remove such workspaces via the `zellij-ws` CLI. Use when a separate task should not touch the current working copy (parallel or side work, experiments, reviews of another branch), when asked to open, list, rename or close a workspace or worktree, or to take over an existing workspace.
+description: Set up separate tasks for the user in their own jj workspace or git worktree with their own zellij tab, optionally started by another agent, check how the agents in those workspaces are doing, and rename or remove workspaces via the `zellij-ws` CLI. Use when asked to prepare or start tasks (e.g. one per issue) for the user to work on in parallel, to report the status of workspaces or their agents, to open, list, rename or close a workspace or worktree, or to take over an existing workspace.
 ---
 
 # Workspaces via `zellij-ws`
@@ -12,6 +12,7 @@ inside the repository; it operates on the repository of the current directory.
 
 ```bash
 zellij-ws list                       # "<name>\t<root>" per workspace, main checkout excluded
+zellij-ws status [NAME]              # "<name>\t<state>\t<root>" per workspace (or just NAME)
 zellij-ws new NAME                   # create (or reopen) NAME, open it in a background tab with a shell
 zellij-ws new NAME -- CMD [ARGS...]  # same, but the tab runs CMD instead of a shell
 zellij-ws rename NEW                 # rename the workspace you are in, and its tab
@@ -34,22 +35,43 @@ A non-zero exit means nothing was done; read the message instead of retrying bli
   outside it `new`, `rename` and `close` still manage the workspace on disk, and
   `new NAME -- CMD` is refused.
 
-## Spinning off a task
+## Starting tasks for the user
 
-1. Pick a short, specific name for the task (`fix-login-timeout`, not `task2`).
-2. Start it, e.g. with another agent and a self-contained prompt (the new agent has none
-   of your context):
+Workspaces are for tasks the user works on, e.g. one per issue from a list you were
+given. Start one only when a task needs its own working copy, and keep tasks you were
+asked to do yourself out of them: do your own implementation work with your own
+subagents, in your own working copy.
+
+1. Pick a short, specific name per task (`fix-login-timeout`, `issue-123`, not `task2`).
+2. Create it, usually with an agent that gets the task going. Its prompt must be
+   self-contained; the new agent has none of your context:
    ```bash
    zellij-ws new fix-login-timeout -- omp "Fix the login timeout in src/auth.rs: ..."
    ```
    Use the agent CLI the user works with (`omp`, `claude`, ...). Without `-- CMD` the tab
-   gets a plain shell for the user.
-3. Tell the user the tab name (`<project>:fix-login-timeout`) and what is running there.
-4. To work in it yourself instead, `cd` into the root `new` printed; never edit another
-   workspace's files from your own.
+   gets a plain shell.
+3. Tell the user each tab name (`<project>:fix-login-timeout`) and what runs there. From
+   then on the user works with that agent; do not type into its pane, steer it, or edit
+   the workspace's files.
 
 `new` with the name of an existing workspace reopens it instead of creating one; if its
 tab is already open, it only reports that, and refuses to start a CMD in it.
+
+## Reading status
+
+`zellij-ws status` reports per workspace what the sidebar shows for its agent:
+
+| state         | meaning                                                              |
+| ------------- | -------------------------------------------------------------------- |
+| `working`     | the agent is running                                                 |
+| `needs-input` | the agent waits for an answer or approval                            |
+| `done`        | the agent finished its turn and the user has not looked at the tab   |
+| `open`        | tab open, nothing to report (idle and already seen, or no agent)     |
+| `closed`      | no tab; the workspace exists on disk only                            |
+
+`done` only means the agent stopped, not that the task is solved: check the result
+itself (commits, a PR, CI, a deploy) before calling a task finished. Status needs
+zellij. Report it when asked; do not loop on it waiting for agents to finish.
 
 ## Renaming and taking over
 
