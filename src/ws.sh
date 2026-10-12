@@ -11,12 +11,18 @@
 #                     repository except the main checkout, if its directory exists
 #   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME;
 #                     jj: on top of bookmark NAME if it exists); succeeds without
-#                     changes if PATH already is a workspace of this repository,
-#                     so the plugin just opens it again
+#                     changes if PATH already is that workspace of this
+#                     repository, so the plugin just opens it again
 #   remove VCS ROOT NAME
 #                     jj: point bookmark NAME at the work only this workspace has,
 #                     forget it and delete ROOT; git: `git worktree remove ROOT`
 #                     (refuses if dirty; the branch stays)
+#   rename VCS ROOT OLD NEW
+#                     rename workspace OLD at ROOT to NEW (`/` becomes `-`) and
+#                     print its root afterwards. jj: the directory stays (jj
+#                     cannot move a workspace), a bookmark OLD marking only this
+#                     workspace's work is renamed along; git: the worktree moves
+#                     next to ROOT, its branch is renamed if it is OLD
 set -eu
 
 info() {
@@ -76,10 +82,12 @@ add)
     here=$(info | cut -f2)
     if there=$(cd "$dir" && info) &&
       [ "$(echo "$there" | cut -f2)" = "$here" ] &&
-      [ "$(echo "$there" | cut -f3)" = "$dir" ]; then
+      [ "$(echo "$there" | cut -f3)" = "$dir" ] &&
+      [ "$(echo "$there" | cut -f4)" = "$(basename "$dir")" ]; then
       exit 0
     fi
-    echo "$dir already exists and is not a workspace of this repository" >&2
+    # also a jj workspace renamed away from its directory's name
+    echo "$dir already exists and is not workspace $(basename "$dir") of this repository" >&2
     exit 1
   fi
   mkdir -p "$(dirname "$dir")"
@@ -122,6 +130,46 @@ remove)
     rm -rf -- "$root"
   else
     git worktree remove "$root"
+  fi
+  ;;
+rename)
+  vcs=$1 root=$2 old=$3 new=$4
+  slug=$(printf %s "$new" | tr / -)
+  if [ "$vcs" = jj ]; then
+    if jj workspace list --ignore-working-copy -T 'name ++ "\n"' | grep -qxF -- "$slug"; then
+      echo "workspace $slug already exists" >&2
+      exit 1
+    fi
+    # a bookmark left by remove/reopen keeps marking this workspace's work
+    ws="$(revset_str "$old")@"
+    own="::$ws ~ ::(working_copies() ~ $ws)"
+    bookmark="bookmarks(exact:$(revset_str "$old"))"
+    if [ -n "$(jj log --ignore-working-copy --no-graph -r "$bookmark" -T 'commit_id')" ] &&
+      [ -z "$(jj log --ignore-working-copy --no-graph -r "$bookmark ~ ($own)" -T 'commit_id')" ]; then
+      jj bookmark rename "$old" "$slug"
+    fi
+    jj --repository "$root" workspace rename "$slug"
+    printf '%s\n' "$root"
+  else
+    dir=$(dirname "$root")/$slug
+    if [ -e "$dir" ]; then
+      echo "$dir already exists" >&2
+      exit 1
+    fi
+    branch=$(git -C "$root" branch --show-current)
+    rename_branch=
+    if [ -n "$branch" ] && [ "$(printf %s "$branch" | tr / -)" = "$old" ]; then
+      if git show-ref --verify --quiet "refs/heads/$new"; then
+        echo "branch $new already exists" >&2
+        exit 1
+      fi
+      rename_branch=1
+    fi
+    git worktree move "$root" "$dir"
+    if [ -n "$rename_branch" ]; then
+      git branch -m "$branch" "$new"
+    fi
+    printf '%s\n' "$dir"
   fi
   ;;
 *)

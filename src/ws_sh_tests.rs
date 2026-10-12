@@ -263,6 +263,71 @@ fn git_worktree_add_info_remove() {
 }
 
 #[test]
+fn jj_rename_keeps_the_directory_and_carries_its_own_bookmark() {
+    let sb = Sandbox::new("jj-rename");
+    let main = sb.dir.join("proj");
+    sb.run("jj", &["git", "init", "proj"], &sb.dir);
+    fs::write(main.join("f"), "a").unwrap();
+    sb.run("jj", &["commit", "-m", "init"], &main);
+    let ws = sb.dir.join("proj.ws");
+    let text = |out: Output| String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // work bookmarked by a remove, then reopened on top of that bookmark
+    let dir = ws.join("feat");
+    assert!(sb.ws(&["add", "jj", &s(&dir), "feat"], &main).status.success());
+    fs::write(dir.join("one"), "1").unwrap();
+    assert!(sb.ws(&["remove", "jj", &s(&dir), "feat"], &main).status.success());
+    assert!(sb.ws(&["add", "jj", &s(&dir), "feat"], &main).status.success());
+    sb.run("jj", &["bookmark", "create", "other", "-r", "@-"], &main);
+
+    let out = sb.ws(&["rename", "jj", &s(&dir), "feat", "user/fix"], &main);
+    assert!(out.status.success(), "rename: {}", stderr(&out));
+    assert_eq!(text(out), s(&dir), "jj workspaces stay where they are");
+    assert_eq!(sb.info(&dir), ["jj", &s(&main), &s(&dir), "user-fix"]);
+    let list = sb.run("jj", &["bookmark", "list", "-T", "name ++ \"\\n\""], &main);
+    assert_eq!(text(list), "other\nuser-fix", "own bookmark follows, unrelated one stays");
+
+    // the old name's directory is not reopened as that name
+    let out = sb.ws(&["add", "jj", &s(&dir), "feat"], &main);
+    assert!(!out.status.success(), "reopened user-fix as feat");
+
+    // taken names are refused without changing anything
+    let taken = ws.join("taken");
+    assert!(sb.ws(&["add", "jj", &s(&taken), "taken"], &main).status.success());
+    let out = sb.ws(&["rename", "jj", &s(&dir), "user-fix", "taken"], &main);
+    assert!(!out.status.success(), "renamed onto an existing workspace");
+    assert_eq!(sb.info(&dir)[3], "user-fix");
+}
+
+#[test]
+fn git_rename_moves_the_worktree_and_its_branch() {
+    let sb = Sandbox::new("git-rename");
+    let main = sb.dir.join("proj");
+    sb.run("git", &["init", "-q", "proj"], &sb.dir);
+    sb.run("git", &["commit", "-q", "--allow-empty", "-m", "init"], &main);
+    let ws = sb.dir.join("proj.ws");
+    let old = ws.join("user-feat");
+    assert!(sb.ws(&["add", "git", &s(&old), "user/feat"], &main).status.success());
+    fs::write(old.join("wip"), "x").unwrap();
+
+    let out = sb.ws(&["rename", "git", &s(&old), "user-feat", "user/fix"], &main);
+    assert!(out.status.success(), "rename: {}", stderr(&out));
+    let new = ws.join("user-fix");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), s(&new));
+    assert!(!old.exists());
+    assert!(new.join("wip").exists(), "uncommitted work moves along");
+    assert_eq!(sb.info(&new), ["git", &s(&main), &s(&new), "user-fix"]);
+    let branch = sb.run("git", &["branch", "--show-current"], &new);
+    assert_eq!(String::from_utf8_lossy(&branch.stdout).trim(), "user/fix");
+
+    // an existing branch of the new name is refused before anything moves
+    sb.run("git", &["branch", "taken"], &main);
+    let out = sb.ws(&["rename", "git", &s(&new), "user-fix", "taken"], &main);
+    assert!(!out.status.success(), "renamed onto an existing branch");
+    assert!(new.exists());
+}
+
+#[test]
 fn info_outside_a_repository_exits_3() {
     let sb = Sandbox::new("none");
     let out = sb.ws(&["info"], &sb.dir);

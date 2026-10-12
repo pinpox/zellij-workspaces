@@ -1,0 +1,182 @@
+#!/bin/sh
+# Create, rename and remove jj workspaces / git worktrees from the command line,
+# each in its own zellij tab, the way the sidebar's Alt w / Alt W dialogs do.
+# Meant for scripts and coding agents; the VCS work is the plugin's own ws.sh.
+#
+# @wsSh@ and @jq@ are filled in by the Nix build.
+set -eu
+
+ws_sh=@wsSh@
+jq=@jq@
+# the plugin's default `separator`: tabs are named project:workspace
+sep=:
+ht=$(printf '\t')
+
+usage() {
+  cat <<'EOF'
+Usage: zellij-ws COMMAND [ARGS]    (run inside a jj or git repository)
+
+  list                      workspaces of the repository except the main checkout,
+                            one "<name><TAB><root>" line each
+  new NAME [-- COMMAND...]  create workspace NAME next to the main checkout, or reopen
+                            an existing one, and open it in a background tab running
+                            COMMAND (default: a shell); prints the workspace root
+  rename [OLD] NEW          rename workspace OLD (default: the current one) and its tab;
+                            prints the workspace root
+  close NAME                remove workspace NAME and close its tab; jj keeps its work
+                            under bookmark NAME, git refuses if the worktree is dirty
+
+Tabs are opened, renamed and closed only inside zellij ($ZELLIJ set).
+EOF
+}
+
+die() {
+  echo "zellij-ws: $*" >&2
+  exit 1
+}
+
+ws() {
+  sh "$ws_sh" "$@"
+}
+
+in_zellij() {
+  [ -n "${ZELLIJ:-}" ]
+}
+
+# workspace directory name for a requested name, like the plugin's dialog
+slug() {
+  s=$(printf %s "$1" | tr / -)
+  case $s in
+  "" | .*) die "invalid workspace name: $1" ;;
+  esac
+  printf %s "$s"
+}
+
+# root of workspace $1 (never the main checkout), empty if there is none
+root_of() {
+  ws "$root" list | awk -F '\t' -v n="$1" '$1 == n { print $2; exit }'
+}
+
+# "<tab id><TAB><tab name>" of the tab named $1, ignoring the agent status
+# marker the plugin appends; empty if there is none
+find_tab() {
+  zellij action list-tabs --json | "$jq" -r --arg n "$1" '
+    map(select((.name | sub(" (⏳|✅|⚙)$"; "")) == $n))
+    | first | select(.) | "\(.tab_id)\t\(.name)"'
+}
+
+[ $# -ge 1 ] || {
+  usage >&2
+  exit 2
+}
+cmd=$1
+shift
+case $cmd in
+-h | --help | help)
+  usage
+  exit 0
+  ;;
+esac
+
+info=$(ws "$PWD" info) || die "not in a jj or git repository: $PWD"
+IFS=$ht read -r vcs main root current <<EOF
+$info
+EOF
+project=$(basename "$main")
+
+case $cmd in
+list)
+  [ $# -eq 0 ] || die "usage: zellij-ws list"
+  ws "$root" list
+  ;;
+
+new)
+  [ $# -ge 1 ] || die "usage: zellij-ws new NAME [-- COMMAND...]"
+  name=$1
+  shift
+  if [ $# -gt 0 ]; then
+    [ "$1" = -- ] || die "usage: zellij-ws new NAME [-- COMMAND...]"
+    shift
+    [ $# -gt 0 ] || die "missing COMMAND after --"
+    in_zellij || die "running a COMMAND needs zellij"
+  fi
+  s=$(slug "$name")
+  open=
+  if in_zellij; then
+    open=$(find_tab "$project$sep$s")
+    if [ -n "$open" ] && [ $# -gt 0 ]; then
+      die "workspace $s is already open in tab $project$sep$s, not starting $1 in it"
+    fi
+  fi
+  dir=$(root_of "$s")
+  if [ -z "$dir" ]; then
+    dir=$(dirname "$main")/$project.ws/$s
+    ws "$root" add "$vcs" "$dir" "$name" >&2
+  fi
+  if in_zellij; then
+    if [ -n "$open" ]; then
+      echo "zellij-ws: $project$sep$s is already open" >&2
+    elif [ $# -gt 0 ]; then
+      zellij action new-tab --no-focus --cwd "$dir" --name "$project$sep$s" -- "$@" >/dev/null
+    else
+      zellij action new-tab --no-focus --cwd "$dir" --name "$project$sep$s" >/dev/null
+    fi
+  fi
+  printf '%s\n' "$dir"
+  ;;
+
+rename)
+  case $# in
+  1)
+    [ "$root" != "$main" ] || die "$root is the main checkout of $project, not renaming it"
+    old=$current
+    dir=$root
+    new=$1
+    ;;
+  2)
+    old=$(slug "$1")
+    dir=$(root_of "$old")
+    [ -n "$dir" ] || die "no workspace $old in $project"
+    new=$2
+    ;;
+  *) die "usage: zellij-ws rename [OLD] NEW" ;;
+  esac
+  s=$(slug "$new")
+  [ "$s" != "$old" ] || die "workspace is already named $s"
+  [ -z "$(root_of "$s")" ] || die "workspace $s already exists in $project"
+  # run from the main checkout: a git worktree moves away under its own cwd
+  dir=$(ws "$main" rename "$vcs" "$dir" "$old" "$new")
+  if in_zellij; then
+    open=$(find_tab "$project$sep$old")
+    if [ -n "$open" ]; then
+      full=${open#*"$ht"}
+      marker=${full#"$project$sep$old"}
+      zellij action rename-tab-by-id "${open%%"$ht"*}" "$project$sep$s$marker"
+    fi
+  fi
+  printf '%s\n' "$dir"
+  ;;
+
+close)
+  [ $# -eq 1 ] || die "usage: zellij-ws close NAME"
+  s=$(slug "$1")
+  dir=$(root_of "$s")
+  [ -n "$dir" ] || die "no workspace $s in $project (the main checkout is never removed)"
+  case "$(pwd -P)/" in
+  "$dir"/*) die "$PWD is inside workspace $s; close it from another workspace" ;;
+  esac
+  # run from the main checkout: the workspace directory is deleted
+  ws "$main" remove "$vcs" "$dir" "$s" >&2
+  if in_zellij; then
+    open=$(find_tab "$project$sep$s")
+    if [ -n "$open" ]; then
+      zellij action close-tab-by-id "${open%%"$ht"*}"
+    fi
+  fi
+  ;;
+
+*)
+  usage >&2
+  exit 2
+  ;;
+esac

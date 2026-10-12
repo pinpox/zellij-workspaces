@@ -60,10 +60,18 @@
               cargo test --frozen
               runHook postCheck
             '';
+            # the plugin, the `zellij-ws` CLI sharing its ws.sh, and the Agent
+            # Skill documenting that CLI (share/skills/<pname>/SKILL.md)
             installPhase = ''
               runHook preInstall
               install -Dm644 target/wasm32-wasip1/release/zellij-workspaces.wasm \
                 $out/share/zellij/plugins/zellij-workspaces.wasm
+              install -Dm644 src/ws.sh $out/libexec/zellij-workspaces/ws.sh
+              install -Dm755 shell/zellij-ws $out/bin/zellij-ws
+              substituteInPlace $out/bin/zellij-ws \
+                --replace-fail @wsSh@ $out/libexec/zellij-workspaces/ws.sh \
+                --replace-fail @jq@ ${pkgs.lib.getExe pkgs.jq}
+              install -Dm644 skill/SKILL.md $out/share/skills/zellij-workspaces/SKILL.md
               runHook postInstall
             '';
           };

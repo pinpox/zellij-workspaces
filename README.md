@@ -46,6 +46,8 @@ Everything lives in the plugin: no shell hooks, scripts or keybindings in your c
   with its last tab.
 - **Agent status icons** (`◆` needs input, `✓` done, spinner while working), set over
   `zellij pipe`, e.g. from Claude Code hooks.
+- **`zellij-ws` CLI and Agent Skill** to create, rename and remove workspaces from
+  scripts and coding agents, e.g. to spin off a task into its own workspace and tab.
 
 Built on [zellij-vtabs](https://github.com/otezz/zellij-vtabs) by Seto Kuslaksono, see
 [Credits](#credits).
@@ -134,6 +136,34 @@ Focus the sidebar pane, then:
 Left click switches or toggles, the scroll wheel moves the selection. Tab moves only
 change the sidebar's order; group order, tab order and collapse state persist per
 session.
+
+## Command line and agents
+
+The Nix package also installs `zellij-ws`, which does from a shell what `Alt w` and
+`Alt W` do, using the same `ws.sh`. Run it inside a repository:
+
+```sh
+zellij-ws list                       # "<name>\t<root>" per workspace, main checkout excluded
+zellij-ws new NAME [-- CMD...]       # create or reopen NAME, open it in a background tab
+                                     # running CMD (default: a shell); prints its root
+zellij-ws rename [OLD] NEW           # rename OLD (default: the current workspace) and its tab
+zellij-ws close NAME                 # remove NAME like Alt W and close its tab
+```
+
+- `new` and `close` behave like the dialogs, including keeping jj work under a bookmark
+  and refusing dirty git worktrees. `close` refuses the workspace it is run from.
+- `rename` for jj renames the workspace and a bookmark of the old name that marks only
+  its own work; the directory stays, as jj cannot move a workspace. For git it moves the
+  worktree to `<project>.ws/NEW` and renames its branch if that was the old name. The
+  main checkout is never renamed.
+- Tabs are only opened, renamed and closed inside zellij. `zellij-ws` assumes the default
+  `separator` (`:`) and needs `jj`/`git` and the session's `zellij` on `PATH`.
+
+`share/skills/zellij-workspaces/SKILL.md` is an [Agent Skill](https://agentskills.io)
+teaching coding agents to use `zellij-ws`: spin off independent work into its own
+workspace, optionally started with another agent (`zellij-ws new fix-x -- claude "…"`),
+rename a workspace they take over, and close workspaces only once asked to. Link it into
+the agent's skill directory, e.g. `~/.claude/skills/zellij-workspaces`.
 
 ## Agent status
 
@@ -224,9 +254,9 @@ Kuslaksono, and most of the plugin is that work. From zellij-vtabs:
 - the design notes on why state has to live in tab names and the cache directory
 
 Added in this fork: workspace-based tab naming from cwd events, the create/remove
-dialogs and their self-registered keybindings, `ws.sh` with its jj/git tests, and the
-Nix flake. The cwd-pipe auto-grouping and the shell worktree helpers of zellij-vtabs
-were replaced by these.
+dialogs and their self-registered keybindings, `ws.sh` with its jj/git tests, the
+`zellij-ws` CLI with its Agent Skill, and the Nix flake. The cwd-pipe auto-grouping and
+the shell worktree helpers of zellij-vtabs were replaced by these.
 
 ## License
 
