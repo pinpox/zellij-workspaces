@@ -592,15 +592,20 @@ impl State {
             .unwrap_or_default();
         // like zellij's own "tab is empty" rule: unselectable panes (status
         // bar, tab bar) don't keep a tab open, nor do hidden helper plugins
-        // (`zellij:link` sits suppressed in the first tab). Suppressed
-        // terminals do count: zellij restores them when their replacement closes.
+        // (`zellij:link` sits suppressed in the first tab) or this plugin's
+        // own instances (the sidebar and an Alt w / Alt W dialog left open,
+        // possibly hidden with the floating layer). Suppressed terminals do
+        // count: zellij restores them when their replacement closes.
         self.own_tab_others = own_panes
             .map(|panes| {
                 panes
                     .iter()
                     .filter(|p| {
                         p.is_selectable
-                            && !(p.is_plugin && (p.id == self.plugin_id || p.is_suppressed))
+                            && !(p.is_plugin
+                                && (p.id == self.plugin_id
+                                    || p.is_suppressed
+                                    || p.plugin_url.is_some() && p.plugin_url == self.own_url))
                     })
                     .count()
             })
