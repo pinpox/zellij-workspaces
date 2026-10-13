@@ -5,10 +5,10 @@
 mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::PathBuf;
 use workspace::{
-    keybind_kdl, parse_info, parse_list, run_ws, slug, workspace_dir, Choice, Dialog, Prompt,
-    WsInfo, NOT_A_REPO,
+    keybind_kdl, parse_info, parse_list, parse_projects, run_ws, session_name, slug,
+    workspace_dir, Choice, Dialog, Picker, Prompt, Target, WsInfo, NOT_A_REPO,
 };
 use zellij_tile::prelude::*;
 
@@ -52,14 +52,15 @@ fn parse_spinner(config: Option<&String>) -> Vec<String> {
     }
 }
 
-/// Group order + collapse state, shared across the per-tab plugin instances and
-/// across restarts. `/cache` is mounted per plugin *location* (host side:
-/// `~/.cache/zellij/<location>/plugin_cache`), so every instance sees the same
-/// files; each re-reads its file on `TabUpdate`, which fires on every tab switch.
-/// One file per *session* (suffix = session name, learned from `ModeUpdate`) —
-/// different sessions have different groups, and a single shared file would let
-/// each session's save wipe the others' state.
-const STATE_FILE_PREFIX: &str = "/cache/state-";
+/// Group order + collapse state, shared across all sidebar instances of all
+/// sessions and across restarts. `/cache` is mounted per plugin *location*
+/// (host side: `~/.cache/zellij/<location>/plugin_cache`), so every instance
+/// in every session sees the same file; each re-reads it on `SessionUpdate`.
+/// One file for all sessions, since every sidebar lists every session.
+const STATE_FILE: &str = "/cache/sessions";
+/// Delay between switching the client away from a session and killing it:
+/// killing it first would end the client with it.
+const LEAVE_DELAY: f64 = 0.5;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Attention {
@@ -76,17 +77,19 @@ fn marker_of(att: Attention) -> &'static str {
     }
 }
 
-/// Zellij's default names for unnamed tabs ("Tab #1", …): such a tab gets its
-/// workspace name probed once, without waiting for a cwd change.
-fn is_default_tab_name(name: &str) -> bool {
-    name.strip_prefix("Tab #")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+/// Zellij's generated session names are `adjective-noun`, e.g.
+/// "gregarious-cactus". Such a session gets named after its workspace.
+fn is_generated_session_name(name: &str) -> bool {
+    name.split_once('-').is_some_and(|(a, b)| {
+        [a, b].iter().all(|w| !w.is_empty() && w.bytes().all(|c| c.is_ascii_lowercase()))
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum EmptyTab {
     Close,
-    Quit,
+    /// the session's last tab: leave the session (and end it)
+    Leave,
 }
 
 /// What to do about the sidebar's own tab, given whether it ever had other
@@ -95,7 +98,7 @@ fn empty_tab_action(had_content: bool, others: usize, tabs: usize) -> Option<Emp
     if !had_content || others > 0 {
         None
     } else if tabs <= 1 {
-        Some(EmptyTab::Quit)
+        Some(EmptyTab::Leave)
     } else {
         Some(EmptyTab::Close)
     }
@@ -172,17 +175,17 @@ fn agent_signal(prev: Option<AgentTitle>, now: Option<AgentTitle>) -> Option<Sig
 }
 
 /// Persisted sidebar state: group display order, collapsed groups, and — only
-/// for groups the user explicitly reordered tabs in — per-group tab label order.
-/// Groups absent from `tab_order` keep following Zellij's native tab positions.
+/// for groups the user explicitly reordered sessions in — per-group session
+/// label order. Groups absent from `session_order` list sessions by name.
 #[derive(Default, PartialEq, Debug)]
 struct Persisted {
     order: Vec<String>,
     collapsed: BTreeSet<String>,
-    tab_order: BTreeMap<String, Vec<String>>,
+    session_order: BTreeMap<String, Vec<String>>,
 }
 
 /// One line per entry: `order <group>` / `collapsed <group>` /
-/// `taborder <group>\t<label>` (labels of one group in order, one per line).
+/// `sessionorder <group>\t<label>` (labels of one group in order, one per line).
 /// Names may contain anything but a newline (and, for groups, a tab).
 /// Unknown lines are ignored.
 fn parse_state(s: &str) -> Persisted {
@@ -192,9 +195,9 @@ fn parse_state(s: &str) -> Persisted {
             p.order.push(g.to_string());
         } else if let Some(g) = line.strip_prefix("collapsed ") {
             p.collapsed.insert(g.to_string());
-        } else if let Some(rest) = line.strip_prefix("taborder ") {
+        } else if let Some(rest) = line.strip_prefix("sessionorder ") {
             if let Some((g, label)) = rest.split_once('\t') {
-                p.tab_order
+                p.session_order
                     .entry(g.to_string())
                     .or_default()
                     .push(label.to_string());
@@ -216,9 +219,9 @@ fn serialize_state(p: &Persisted) -> String {
         out.push_str(g);
         out.push('\n');
     }
-    for (g, labels) in &p.tab_order {
+    for (g, labels) in &p.session_order {
         for label in labels {
-            out.push_str("taborder ");
+            out.push_str("sessionorder ");
             out.push_str(g);
             out.push('\t');
             out.push_str(label);
@@ -230,7 +233,7 @@ fn serialize_state(p: &Persisted) -> String {
 
 /// Stable-sort items into saved label order; labels not in `saved` keep their
 /// native relative order after the saved ones (and duplicates stay stable).
-fn sort_by_saved(items: &mut [TabItem], saved: &[String]) {
+fn sort_by_saved(items: &mut [Item], saved: &[String]) {
     items.sort_by_key(|it| {
         saved
             .iter()
@@ -290,17 +293,30 @@ fn parse_attention(name: &str) -> (Option<Attention>, &str) {
 
 #[derive(Default)]
 struct State {
+    /// tabs of the own session
     tabs: Vec<TabInfo>,
     /// terminal pane id -> tab position (rebuilt on each PaneUpdate)
     pane_tab: BTreeMap<u32, usize>,
+    /// live sessions, the own one included, as of the last SessionUpdate
+    sessions: Vec<SessionInfo>,
+    /// a SessionUpdate has arrived
+    sessions_known: bool,
+    /// former names of the own session that SessionUpdate may still list as
+    /// another session (zellij keeps the entry after a rename until the
+    /// session list changes)
+    renamed_from: BTreeSet<String>,
+    /// the own session has a client attached, so its active tab is seen
+    attached: bool,
     collapsed: BTreeSet<String>,
     /// saved group display order; groups not listed here follow in first-appearance order
     group_order: Vec<String>,
-    /// per-group saved tab label order; groups not present follow native tab positions
-    tab_order: BTreeMap<String, Vec<String>>,
-    /// session name (from ModeUpdate) — state persistence is a no-op until known
+    /// per-group saved session label order; groups not present list sessions by name
+    session_order: BTreeMap<String, Vec<String>>,
+    /// name of the own session (from ModeUpdate)
     session: Option<String>,
     selected: usize,
+    /// row of the own session at the last update; the selection follows it
+    current_row: Option<usize>,
     separator: char,
     waiting_icon: String,
     completed_icon: String,
@@ -318,14 +334,23 @@ struct State {
     /// the own tab has had other panes (a fresh tab may report the sidebar
     /// before its terminal exists)
     own_tab_had_content: bool,
-    /// close/quit already requested for the own tab
+    /// close/leave already requested for the own tab
     closing: bool,
+    /// session to kill once the client has switched away from it, and
+    /// whether the timer that kills it is the one pending
+    leaving: Option<String>,
+    leave_armed: bool,
     granted: bool,
     keys_bound: bool,
     new_key: String,
     close_key: String,
-    /// tab id whose default "Tab #N" name was already probed
-    probed_tab: Option<usize>,
+    goto_key: String,
+    /// where the go-to picker looks for repositories (`:`-separated), and
+    /// how many directories deep
+    project_roots: String,
+    project_depth: String,
+    /// the own session's name was checked for renaming after its workspace
+    autonamed: bool,
     dialog: Dialog,
     /// active inline rename edit: (target, input buffer)
     renaming: Option<(RenameTarget, String)>,
@@ -344,8 +369,8 @@ struct State {
 
 enum RenameTarget {
     Group(String),
-    /// tab position; edits the tab's label (group prefix is kept)
-    Tab(usize),
+    /// session name; edits its label (group prefix is kept)
+    Session(String),
 }
 
 // The plugin entry points call zellij-tile's wasm host imports, which don't exist
@@ -353,17 +378,25 @@ enum RenameTarget {
 #[cfg(not(test))]
 register_plugin!(State);
 
-/// A tab within a group, while building the tree.
-struct TabItem {
-    position: usize,
+/// A session within a group, while building the tree.
+struct Item {
+    session: String,
     label: String,
-    active: bool,
+    current: bool,
     attention: Option<Attention>,
 }
 
 enum Row {
     Group { name: String, collapsed: bool, count: usize, attention: Option<Attention> },
-    Tab { position: usize, label: String, active: bool, attention: Option<Attention> },
+    Session { session: String, label: String, current: bool, attention: Option<Attention> },
+}
+
+/// The most urgent marker on any of the tabs.
+fn rollup(tabs: &[TabInfo]) -> Option<Attention> {
+    tabs.iter().fold(None, |acc, t| match parse_attention(&t.name).0 {
+        Some(x) => Some(merge(acc, x)),
+        None => acc,
+    })
 }
 
 impl State {
@@ -377,12 +410,51 @@ impl State {
         }
     }
 
-    /// Groups in first-appearance (tab position) order.
+    /// Every live session with the rollup of its tabs' markers, by name. The
+    /// own session's tabs come from TabUpdate: SessionUpdate lags up to a
+    /// second behind, and may still carry the own session's old name after
+    /// a rename.
+    fn session_summaries(&self) -> Vec<(String, Option<Attention>)> {
+        let mut out: Vec<(String, Option<Attention>)> = self
+            .other_sessions()
+            .map(|s| (s.name.clone(), rollup(&s.tabs)))
+            .collect();
+        if let Some(own) = &self.session {
+            out.push((own.clone(), rollup(&self.tabs)));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Live sessions other than the own one.
+    fn other_sessions(&self) -> impl Iterator<Item = &SessionInfo> {
+        self.sessions.iter().filter(|s| {
+            !s.is_current_session
+                && Some(&s.name) != self.session.as_ref()
+                && !self.renamed_from.contains(&s.name)
+        })
+    }
+
+    fn is_live(&self, name: &str) -> bool {
+        self.session.as_deref() == Some(name) || self.other_sessions().any(|s| s.name == name)
+    }
+
+    /// Take the own session's name from ModeUpdate; true if it changed.
+    fn set_session_name(&mut self, name: Option<String>) -> bool {
+        if name == self.session {
+            return false;
+        }
+        if let Some(old) = std::mem::replace(&mut self.session, name) {
+            self.renamed_from.insert(old);
+        }
+        true
+    }
+
+    /// Groups in first-appearance (session name) order.
     fn appearance_groups(&self) -> Vec<String> {
         let mut out = Vec::new();
-        for t in &self.tabs {
-            let (_, base) = parse_attention(&t.name);
-            let (g, _) = self.group_of(base);
+        for (name, _) in self.session_summaries() {
+            let (g, _) = self.group_of(&name);
             if !out.contains(&g) {
                 out.push(g);
             }
@@ -394,54 +466,51 @@ impl State {
         merge_order(&self.group_order, self.appearance_groups())
     }
 
-    fn state_file(&self) -> Option<String> {
-        self.session
-            .as_ref()
-            .map(|s| format!("{}{}", STATE_FILE_PREFIX, s))
-    }
-
     fn load_state(&mut self) {
-        let Some(path) = self.state_file() else {
-            return;
-        };
-        if let Ok(s) = std::fs::read_to_string(path) {
+        if let Ok(s) = std::fs::read_to_string(STATE_FILE) {
             let p = parse_state(&s);
             self.group_order = p.order;
             self.collapsed = p.collapsed;
-            self.tab_order = p.tab_order;
+            self.session_order = p.session_order;
         }
     }
 
     fn save_state(&self) {
-        let Some(path) = self.state_file() else {
-            return;
-        };
         let p = Persisted {
             order: self.display_group_order(),
             collapsed: self.collapsed.clone(),
-            tab_order: self.tab_order.clone(),
+            session_order: self.session_order.clone(),
         };
-        let _ = std::fs::write(path, serialize_state(&p));
+        let _ = std::fs::write(STATE_FILE, serialize_state(&p));
     }
 
-    /// Groups in display order, each with its tabs in display order.
-    fn grouped_items(&self) -> Vec<(String, Vec<TabItem>)> {
-        let mut groups: BTreeMap<String, Vec<TabItem>> = BTreeMap::new();
-        for t in &self.tabs {
-            let (attention, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of(base);
-            groups.entry(g).or_default().push(TabItem {
-                position: t.position,
+    /// The persisted fields as they are in memory, for change detection.
+    fn persisted(&self) -> Persisted {
+        Persisted {
+            order: self.group_order.clone(),
+            collapsed: self.collapsed.clone(),
+            session_order: self.session_order.clone(),
+        }
+    }
+
+    /// Groups in display order, each with its sessions in display order.
+    fn grouped_items(&self) -> Vec<(String, Vec<Item>)> {
+        let mut groups: BTreeMap<String, Vec<Item>> = BTreeMap::new();
+        for (name, attention) in self.session_summaries() {
+            let (g, label) = self.group_of(&name);
+            let item = Item {
                 label: label.to_string(),
-                active: t.active,
+                current: self.session.as_ref() == Some(&name),
                 attention,
-            });
+                session: name.clone(),
+            };
+            groups.entry(g).or_default().push(item);
         }
         self.display_group_order()
             .iter()
             .filter_map(|g| {
                 let mut items = groups.remove(g)?;
-                if let Some(saved) = self.tab_order.get(g) {
+                if let Some(saved) = self.session_order.get(g) {
                     sort_by_saved(&mut items, saved);
                 }
                 Some((g.clone(), items))
@@ -452,24 +521,23 @@ impl State {
     fn build_rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
         for (g, items) in self.grouped_items() {
-            let g = &g;
-            let collapsed = self.collapsed.contains(g);
+            let collapsed = self.collapsed.contains(&g);
             let group_att = items.iter().fold(None, |acc, it| match it.attention {
                 Some(x) => Some(merge(acc, x)),
                 None => acc,
             });
             rows.push(Row::Group {
-                name: g.clone(),
+                name: g,
                 collapsed,
                 count: items.len(),
                 attention: group_att,
             });
             if !collapsed {
                 for it in items {
-                    rows.push(Row::Tab {
-                        position: it.position,
+                    rows.push(Row::Session {
+                        session: it.session,
                         label: it.label,
-                        active: it.active,
+                        current: it.current,
                         attention: it.attention,
                     });
                 }
@@ -478,10 +546,20 @@ impl State {
         rows
     }
 
-    fn active_row_index(&self) -> Option<usize> {
-        self.build_rows()
+    /// Keep the selection on the own session's row when that row moves, and
+    /// within the rows otherwise.
+    fn sync_selection(&mut self) {
+        let rows = self.build_rows();
+        let current = rows
             .iter()
-            .position(|r| matches!(r, Row::Tab { active: true, .. }))
+            .position(|r| matches!(r, Row::Session { current: true, .. }));
+        if let Some(i) = current.filter(|_| current != self.current_row) {
+            self.selected = i;
+        }
+        self.current_row = current;
+        if !rows.is_empty() && self.selected >= rows.len() {
+            self.selected = rows.len() - 1;
+        }
     }
 
     fn icon(&self, att: Option<Attention>) -> String {
@@ -501,15 +579,15 @@ impl State {
     }
 
     fn any_working(&self) -> bool {
-        self.tabs
+        self.session_summaries()
             .iter()
-            .any(|t| parse_attention(&t.name).0 == Some(Attention::Working))
+            .any(|(_, att)| *att == Some(Attention::Working))
     }
 
     /// Keep one timer running once permitted: at the spinner's rate while a
-    /// tab is working, else at the title poll's.
+    /// session is working, else at the title poll's.
     fn ensure_timer(&mut self) {
-        if self.timer_running || !self.granted {
+        if self.timer_running || !self.granted || self.leaving.is_some() {
             return;
         }
         self.timer_interval = if self.any_working() { SPINNER_INTERVAL } else { POLL_INTERVAL };
@@ -540,8 +618,9 @@ impl State {
         let (att, base) = parse_attention(&t.name);
         // Never mark the tab you're already looking at — you don't need an
         // attention cue for it, and it keeps set/clear free of any race.
-        // But a working spinner on it still has to END now.
-        if t.active {
+        // But a working spinner on it still has to END now. Without a client
+        // on the session nobody looks at its active tab.
+        if t.active && self.attached {
             if att == Some(Attention::Working) {
                 rename_tab_with_id(t.tab_id as u64, base.to_string());
             }
@@ -590,10 +669,10 @@ impl State {
 
     /// Follow the agent states that terminal titles show (see
     /// `parse_agent_title`), one state per tab: its strongest agent. Every
-    /// running instance handles every tab, because zellij starts the sidebar
-    /// of a tab opened in the background only once it is shown; the renames
-    /// are idempotent, as for pipes. `titles`: (tab position, pane, title) of
-    /// every terminal pane.
+    /// running instance handles every tab of its session, because zellij
+    /// starts the sidebar of a tab opened in the background only once it is
+    /// shown; the renames are idempotent, as for pipes. `titles`: (tab
+    /// position, pane, title) of every terminal pane.
     fn track_agents(&mut self, titles: Vec<(usize, u32, String)>) {
         if !self.granted {
             return;
@@ -651,57 +730,39 @@ impl State {
         self.track_agents(titles);
     }
 
-    /// Ask the host which workspace `cwd` belongs to; the answer renames the
-    /// tab of `pane_id` (see `rename_for_workspace`).
-    fn probe_name(&self, pane_id: u32, cwd: &Path) {
-        let context = BTreeMap::from([
-            ("op".to_string(), "name".to_string()),
-            ("pane".to_string(), pane_id.to_string()),
-        ]);
-        run_ws(&["info"], &cwd.to_string_lossy(), context);
-    }
-
-    /// Name the tab containing `pane_id` `project:workspace`, keeping its
-    /// attention marker.
-    fn rename_for_workspace(&self, pane_id: u32, info: &WsInfo) {
-        let Some(t) = self.fresh_tab(pane_id) else {
-            return;
-        };
-        let (att, base) = parse_attention(&t.name);
-        let name = info.tab_name(self.separator);
-        if base != name {
-            let marker = att.map(marker_of).unwrap_or("");
-            rename_tab_with_id(t.tab_id as u64, format!("{}{}", name, marker));
-        }
-    }
-
-    /// Shells only report a cwd *change*, so a tab whose shell starts inside a
-    /// repository (first tab, `Ctrl t n`) still has its default name: probe its
-    /// first pane's cwd once.
-    fn probe_default_tab(&mut self) {
-        if !self.granted {
+    /// A session zellij named itself that was started inside a repository is
+    /// renamed `project:workspace`, once (see `rename_after_workspace`).
+    fn probe_session_name(&mut self) {
+        if self.autonamed || !self.granted || !self.sessions_known {
             return;
         }
-        let Some(tab) = self
-            .own_tab
-            .and_then(|pos| self.tabs.iter().find(|t| t.position == pos))
-        else {
+        let Some(name) = &self.session else {
             return;
         };
-        if self.probed_tab == Some(tab.tab_id) || !is_default_tab_name(parse_attention(&tab.name).1)
-        {
+        if !is_generated_session_name(name) {
+            self.autonamed = true;
             return;
         }
         let Some(&pane_id) = self.own_terminal_panes.first() else {
             return;
         };
-        self.probed_tab = Some(tab.tab_id);
+        self.autonamed = true;
         if let Ok(cwd) = get_pane_cwd(PaneId::Terminal(pane_id)) {
-            self.probe_name(pane_id, &cwd);
+            let context = BTreeMap::from([("op".to_string(), "name".to_string())]);
+            run_ws(&["info"], &cwd.to_string_lossy(), context);
         }
     }
 
-    /// Register the create/remove keybindings (in memory, not written to the
+    /// Rename the own session after its workspace unless another session
+    /// has that name already.
+    fn rename_after_workspace(&self, info: &WsInfo) {
+        let name = info.session_name(self.separator);
+        if self.session.as_deref().is_some_and(is_generated_session_name) && !self.is_live(&name) {
+            rename_session(&name);
+        }
+    }
+
+    /// Register the dialogs' keybindings (in memory, not written to the
     /// user's config). Every sidebar instance binds the same keys to the same
     /// action, so repeating this per tab is harmless.
     fn bind_keys(&mut self) {
@@ -711,7 +772,18 @@ impl State {
         let Some(url) = &self.own_url else {
             return;
         };
-        if let Some(kdl) = keybind_kdl(url, &self.new_key, &self.close_key) {
+        let binds = [
+            (self.new_key.as_str(), "new"),
+            (self.close_key.as_str(), "close"),
+            (self.goto_key.as_str(), "goto"),
+        ];
+        let separator = self.separator.to_string();
+        let config = [
+            ("separator", separator.as_str()),
+            ("project_roots", self.project_roots.as_str()),
+            ("project_depth", self.project_depth.as_str()),
+        ];
+        if let Some(kdl) = keybind_kdl(url, &binds, &config) {
             reconfigure(kdl, false);
         }
         self.keys_bound = true;
@@ -764,21 +836,135 @@ impl State {
         }
     }
 
+    /// Record what a SessionUpdate says about the own session and the others.
+    /// The own session's name comes from ModeUpdate only: a SessionUpdate may
+    /// still carry the old one after a rename.
+    fn update_sessions(&mut self, sessions: Vec<SessionInfo>) {
+        if let Some(own) = sessions.iter().find(|s| s.is_current_session) {
+            self.attached = own.connected_clients > 0;
+            // until ModeUpdate tells; later this may be a stale name
+            if self.session.is_none() {
+                self.session = Some(own.name.clone());
+            }
+        }
+        // a ghost is gone once a session list without it arrives; a session
+        // of that name appearing later is a real one
+        self.renamed_from.retain(|n| sessions.iter().any(|s| &s.name == n));
+        self.sessions = sessions;
+        self.sessions_known = true;
+    }
+
+    /// Apply a session list (SessionUpdate, or a scan of our own); true if
+    /// the sidebar changed.
+    fn on_sessions(&mut self, sessions: Vec<SessionInfo>) -> bool {
+        let before = (self.session_summaries(), self.persisted());
+        let was_attached = self.attached;
+        self.update_sessions(sessions);
+        // Pick up order/collapse changes written by other instances.
+        self.load_state();
+        // a client arrived: the tab it looks at is seen now
+        if self.attached && !was_attached {
+            self.clear_seen_tab();
+            // the keybindings only reach clients connected at the time
+            self.keys_bound = false;
+            self.bind_keys();
+        }
+        self.sync_selection();
+        self.ensure_timer();
+        self.probe_session_name();
+        before != (self.session_summaries(), self.persisted())
+    }
+
+    /// Zellij reads the other sessions' state only when a plugin asks for
+    /// it (which also sends the result to every plugin of the session as a
+    /// SessionUpdate). The sidebar on screen asks on every title poll.
+    fn refresh_sessions(&mut self) -> bool {
+        let on_screen = self.attached
+            && self
+                .own_tab
+                .is_some_and(|pos| self.tabs.iter().any(|t| t.position == pos && t.active));
+        if !on_screen {
+            return false;
+        }
+        match get_session_list() {
+            Ok(list) => self.on_sessions(list.live_sessions),
+            Err(_) => false,
+        }
+    }
+
+    /// The session to move the client to when leaving `own`: the first other
+    /// one of its project in sidebar order, else the first other one at all.
+    fn fallback_session(&self, own: &str) -> Option<String> {
+        let (group, _) = self.group_of(own);
+        let items = self.grouped_items();
+        let first_other = |only: Option<&str>| {
+            items
+                .iter()
+                .filter(|(g, _)| only.is_none_or(|o| o == g))
+                .flat_map(|(_, its)| its)
+                .map(|it| &it.session)
+                .find(|s| s.as_str() != own)
+                .cloned()
+        };
+        first_other(Some(&group)).or_else(|| first_other(None))
+    }
+
+    /// Switch the client to another session and end this one shortly after;
+    /// without another session, start one in `fallback_cwd`, or quit.
+    fn leave_session(&mut self, fallback_cwd: Option<&str>) {
+        let Some(own) = self.session.clone() else {
+            quit_zellij();
+            return;
+        };
+        match (self.fallback_session(&own), fallback_cwd) {
+            (Some(other), _) => switch_session(Some(&other)),
+            // a new session, named by its sidebar after the workspace there
+            (None, Some(cwd)) => switch_session_with_cwd(None, Some(PathBuf::from(cwd))),
+            (None, None) => {
+                quit_zellij();
+                return;
+            }
+        }
+        self.leaving = Some(own);
+        if !self.timer_running {
+            self.arm_leave();
+        }
+    }
+
+    fn arm_leave(&mut self) {
+        set_timeout(LEAVE_DELAY);
+        self.timer_running = true;
+        self.leave_armed = true;
+    }
+
+    /// A timer fired while leaving: the first one may have been set before
+    /// the switch (the title poll), so the session is killed on a timer of
+    /// LEAVE_DELAY set once no other one is pending. True while leaving.
+    fn leave_tick(&mut self) -> bool {
+        let Some(session) = self.leaving.clone() else {
+            return false;
+        };
+        if self.leave_armed {
+            kill_sessions(&[session]);
+            self.leaving = None;
+        } else {
+            self.arm_leave();
+        }
+        true
+    }
+
     /// The sidebar keeps its tab alive after the last real pane is gone, which
-    /// zellij would otherwise close: close the tab, or end the session when it
-    /// is the last one, like zellij does when the last pane exits. The
-    /// workspace on disk is untouched; Alt w with its name reopens it.
+    /// zellij would otherwise close: close the tab, or leave and end the
+    /// session when it is the last one, like zellij ends a session when its
+    /// last pane exits. The workspace on disk is untouched; Alt w reopens it.
     fn close_if_empty(&mut self) {
         if self.closing {
             return;
         }
         match empty_tab_action(self.own_tab_had_content, self.own_tab_others, self.tabs.len()) {
-            Some(EmptyTab::Quit) => {
-                if let Some(path) = self.state_file() {
-                    let _ = std::fs::remove_file(path);
-                }
+            Some(EmptyTab::Leave) => {
                 self.closing = true;
-                quit_zellij();
+                self.leave_session(None);
             }
             Some(EmptyTab::Close) => {
                 if let Some(tab_id) = self.own_tab_id() {
@@ -795,11 +981,15 @@ impl State {
         self.tabs.iter().find(|t| t.position == pos).map(|t| t.tab_id)
     }
 
-    /// Strip a *seen* attention marker from the tab at `pos` (global rename).
-    /// A working spinner survives focus — peeking at a running task must not
-    /// kill its indicator; only waiting/completed are "acknowledged by looking".
-    fn clear_tab(&self, pos: usize) {
-        if let Some(t) = self.tabs.iter().find(|t| t.position == pos) {
+    /// Strip a *seen* attention marker from the active tab (global rename),
+    /// if a client looks at this session. A working spinner survives focus —
+    /// peeking at a running task must not kill its indicator; only
+    /// waiting/completed are "acknowledged by looking".
+    fn clear_seen_tab(&self) {
+        if !self.attached {
+            return;
+        }
+        if let Some(t) = self.tabs.iter().find(|t| t.active) {
             let (att, base) = parse_attention(&t.name);
             if matches!(att, Some(Attention::Waiting) | Some(Attention::Completed)) {
                 rename_tab_with_id(t.tab_id as u64, base.to_string());
@@ -809,28 +999,26 @@ impl State {
 
     fn activate(&mut self, idx: usize) -> bool {
         let rows = self.build_rows();
-        if idx >= rows.len() {
-            return false;
-        }
-        match &rows[idx] {
-            Row::Group { name, .. } => {
-                if self.collapsed.contains(name) {
-                    self.collapsed.remove(name);
-                } else {
+        match rows.get(idx) {
+            Some(Row::Group { name, .. }) => {
+                if !self.collapsed.remove(name) {
                     self.collapsed.insert(name.clone());
                 }
                 self.save_state();
                 true
             }
-            Row::Tab { position, .. } => {
-                switch_tab_to(*position as u32 + 1);
+            Some(Row::Session { session, current, .. }) => {
+                if !current {
+                    switch_session(Some(session));
+                }
                 true
             }
+            None => false,
         }
     }
 
     /// Move the row under the selection up/down (persisted): a group header
-    /// reorders the group, a tab row reorders the tab within its group.
+    /// reorders the group, a session row reorders the session within its group.
     fn move_selected(&mut self, delta: isize) -> bool {
         let rows = self.build_rows();
         match rows.get(self.selected) {
@@ -852,29 +1040,28 @@ impl State {
                 }
                 true
             }
-            Some(Row::Tab { position, label, .. }) => {
-                let (position, label) = (*position, label.clone());
+            Some(Row::Session { session, label, .. }) => {
+                let (session, label) = (session.clone(), label.clone());
                 let Some((group, items)) = self
                     .grouped_items()
                     .into_iter()
-                    .find(|(_, items)| items.iter().any(|it| it.position == position))
+                    .find(|(_, items)| items.iter().any(|it| it.session == session))
                 else {
                     return false;
                 };
-                let mut labels: Vec<String> =
-                    items.into_iter().map(|it| it.label).collect();
+                let mut labels: Vec<String> = items.into_iter().map(|it| it.label).collect();
                 if !move_in(&mut labels, &label, delta) {
                     return false;
                 }
                 let present = self.appearance_groups();
-                self.tab_order.retain(|g, _| present.contains(g));
-                self.tab_order.insert(group, labels);
+                self.session_order.retain(|g, _| present.contains(g));
+                self.session_order.insert(group, labels);
                 self.save_state();
-                // keep the selection on the tab we just moved
+                // keep the selection on the session we just moved
                 if let Some(idx) = self
                     .build_rows()
                     .iter()
-                    .position(|r| matches!(r, Row::Tab { position: p, .. } if *p == position))
+                    .position(|r| matches!(r, Row::Session { session: s, .. } if *s == session))
                 {
                     self.selected = idx;
                 }
@@ -884,7 +1071,7 @@ impl State {
         }
     }
 
-    /// Move `old` group's saved order/collapse/tab-order entries to `new`.
+    /// Move `old` group's saved order/collapse/session-order entries to `new`.
     fn migrate_group_state(&mut self, old: &str, new: &str) {
         for g in self.group_order.iter_mut() {
             if g == old {
@@ -897,54 +1084,56 @@ impl State {
         if self.collapsed.remove(old) {
             self.collapsed.insert(new.to_string());
         }
-        if let Some(order) = self.tab_order.remove(old) {
-            self.tab_order.entry(new.to_string()).or_insert(order);
+        if let Some(order) = self.session_order.remove(old) {
+            self.session_order.entry(new.to_string()).or_insert(order);
         }
     }
 
-    /// Rename group `old` to `new`: re-prefix every member tab (preserving
-    /// attention marks) and migrate the group's saved state.
+    /// Rename a live session unless another one has the new name: the own
+    /// one directly, others through the zellij CLI.
+    fn rename_live_session(&self, old: &str, new: &str) {
+        if old == new || self.is_live(new) {
+            return;
+        }
+        if self.session.as_deref() == Some(old) {
+            rename_session(new);
+        } else {
+            run_command(&["zellij", "-s", old, "action", "rename-session", new], BTreeMap::new());
+        }
+    }
+
+    /// Rename group `old` to `new`: re-prefix every member session and
+    /// migrate the group's saved state.
     fn commit_rename(&mut self, old: &str, new: &str) {
         let new = new.trim();
         if new.is_empty() || new == old {
             return;
         }
-        for t in &self.tabs {
-            let (att, base) = parse_attention(&t.name);
-            let (g, label) = self.group_of(base);
-            if g != old {
-                continue;
+        for (name, _) in self.session_summaries() {
+            let (g, label) = self.group_of(&name);
+            if g == old {
+                self.rename_live_session(&name, &format!("{}{}{}", new, self.separator, label));
             }
-            let marker = att.map(marker_of).unwrap_or("");
-            rename_tab(
-                t.position as u32 + 1,
-                format!("{}{}{}{}", new, self.separator, label, marker),
-            );
         }
         self.migrate_group_state(old, new);
         self.save_state();
     }
 
-    /// Rename the label of the tab at `position`, keeping its group prefix
-    /// (ungrouped tabs stay ungrouped) and attention mark.
-    fn commit_tab_rename(&mut self, position: usize, new_label: &str) {
+    /// Rename the label of session `session`, keeping its group prefix
+    /// (ungrouped sessions stay ungrouped).
+    fn commit_session_rename(&mut self, session: &str, new_label: &str) {
         let new_label = new_label.trim();
-        let Some(t) = self.tabs.iter().find(|t| t.position == position) else {
-            return;
-        };
-        let (att, base) = parse_attention(&t.name);
-        let (g, old_label) = self.group_of(base);
+        let (g, old_label) = self.group_of(session);
         if new_label.is_empty() || new_label == old_label {
             return;
         }
-        let marker = att.map(marker_of).unwrap_or("");
-        let name = if base.find(self.separator).is_none() {
+        let name = if session.find(self.separator).is_none() {
             new_label.to_string()
         } else {
             format!("{}{}{}", g, self.separator, new_label)
         };
-        rename_tab(position as u32 + 1, format!("{}{}", name, marker));
-        if let Some(order) = self.tab_order.get_mut(&g) {
+        self.rename_live_session(session, &name);
+        if let Some(order) = self.session_order.get_mut(&g) {
             rename_label(order, old_label, new_label);
             self.save_state();
         }
@@ -960,7 +1149,7 @@ impl State {
             BareKey::Enter => {
                 match &target {
                     RenameTarget::Group(old) => self.commit_rename(&old.clone(), &buf),
-                    RenameTarget::Tab(pos) => self.commit_tab_rename(*pos, &buf),
+                    RenameTarget::Session(s) => self.commit_session_rename(&s.clone(), &buf),
                 }
                 return true;
             }
@@ -968,8 +1157,9 @@ impl State {
             BareKey::Backspace => {
                 buf.pop();
             }
-            // separator/tab would corrupt group parsing / the state file format
-            BareKey::Char(c) if plain && !c.is_control() && c != self.separator => {
+            // the separator would corrupt group parsing, a tab the state file
+            // format; session names cannot contain `/`
+            BareKey::Char(c) if plain && !c.is_control() && c != self.separator && c != '/' => {
                 buf.push(c);
             }
             _ => {}
@@ -1009,13 +1199,12 @@ impl State {
                 let rows = self.build_rows();
                 match rows.get(self.selected) {
                     Some(Row::Group { name, .. }) => {
-                        self.renaming =
-                            Some((RenameTarget::Group(name.clone()), name.clone()));
+                        self.renaming = Some((RenameTarget::Group(name.clone()), name.clone()));
                         true
                     }
-                    Some(Row::Tab { position, label, .. }) => {
+                    Some(Row::Session { session, label, .. }) => {
                         self.renaming =
-                            Some((RenameTarget::Tab(*position), label.clone()));
+                            Some((RenameTarget::Session(session.clone()), label.clone()));
                         true
                     }
                     None => false,
@@ -1065,6 +1254,7 @@ enum Mode {
     Sidebar,
     New,
     Close,
+    Goto,
 }
 
 fn command_error(code: Option<i32>, stderr: &[u8]) -> String {
@@ -1084,12 +1274,20 @@ impl State {
                 if status == PermissionStatus::Granted {
                     let title = match self.mode {
                         Mode::Close => "remove workspace",
+                        Mode::Goto => "go to",
                         _ => "new workspace",
                     };
                     rename_plugin_pane(self.plugin_id, title);
-                    let cwd = get_plugin_ids().initial_cwd;
-                    let context = BTreeMap::from([("op".to_string(), "probe".to_string())]);
-                    run_ws(&["info"], &cwd.to_string_lossy(), context);
+                    if let Ok(list) = get_session_list() {
+                        self.update_sessions(list.live_sessions);
+                    }
+                    if self.mode == Mode::Goto {
+                        self.start_goto();
+                    } else {
+                        let cwd = get_plugin_ids().initial_cwd;
+                        let context = BTreeMap::from([("op".to_string(), "probe".to_string())]);
+                        run_ws(&["info"], &cwd.to_string_lossy(), context);
+                    }
                 } else {
                     self.dialog = Dialog::Error("permissions were denied".to_string());
                 }
@@ -1099,8 +1297,17 @@ impl State {
                 self.tabs = tabs;
                 false
             }
-            Event::PaneUpdate(manifest) => {
-                self.update_panes(&manifest);
+            Event::ModeUpdate(mode_info) => {
+                self.set_session_name(mode_info.session_name);
+                false
+            }
+            Event::SessionUpdate(sessions, _) => {
+                self.update_sessions(sessions);
+                matches!(self.dialog, Dialog::Prompt { .. })
+            }
+            Event::Timer(_) => {
+                self.timer_running = false;
+                self.leave_tick();
                 false
             }
             Event::RunCommandResult(code, stdout, stderr, context) => {
@@ -1133,7 +1340,7 @@ impl State {
                         _ => {
                             let context =
                                 BTreeMap::from([("op".to_string(), "list".to_string())]);
-                            run_ws(&["list"], &info.root, context);
+                            run_ws(&["list", "all"], &info.root, context);
                             Dialog::Prompt { info, prompt: Prompt::default() }
                         }
                     },
@@ -1150,37 +1357,70 @@ impl State {
                 }
             }
             Some("add") if ok => {
-                if let (Some(tab), Some(dir)) = (context.get("tab"), context.get("dir")) {
-                    self.open_tab(tab, dir);
+                if let (Some(session), Some(dir)) = (context.get("session"), context.get("dir")) {
+                    self.open_session(session, dir);
                 }
                 close_self();
             }
             Some("remove") if ok => {
-                if let Some(tab_id) = self.own_tab_id() {
-                    close_tab_with_id(tab_id as u64);
+                if let (Some(session), Some(main)) = (context.get("session"), context.get("main")) {
+                    self.end_session(session, main);
                 }
-                close_self();
             }
             Some("add") | Some("remove") => {
                 self.dialog = Dialog::Error(command_error(code, stderr));
             }
+            Some("projects") => {
+                if let Dialog::Goto(picker) = &mut self.dialog {
+                    picker.targets.extend(parse_projects(&String::from_utf8_lossy(stdout)));
+                }
+            }
+            Some("open") => match parse_info(&String::from_utf8_lossy(stdout)) {
+                Some(info) if ok => {
+                    self.open_session(&info.session_name(self.separator), &info.root);
+                    close_self();
+                }
+                _ => self.dialog = Dialog::Error(command_error(code, stderr)),
+            },
             _ => {}
         }
     }
 
-    /// The tab already showing workspace tab name `name`, if any.
-    fn tab_named(&self, name: &str) -> Option<&TabInfo> {
-        self.tabs.iter().find(|t| parse_attention(&t.name).1 == name)
+    /// The go-to picker: running sessions right away, repositories once the
+    /// scan of the project roots is done.
+    fn start_goto(&mut self) {
+        let sessions = self.session_summaries().into_iter().map(|(name, _)| Target::Session(name));
+        self.dialog = Dialog::Goto(Picker { targets: sessions.collect(), ..Default::default() });
+        let mut args = vec!["projects", self.project_depth.as_str()];
+        args.extend(self.project_roots.split(':').filter(|r| !r.is_empty()));
+        let context = BTreeMap::from([("op".to_string(), "projects".to_string())]);
+        run_ws(&args, "/", context);
     }
 
-    /// Switch to the workspace's tab, or open one in `dir`.
-    fn open_tab(&self, name: &str, dir: &str) {
-        match self.tab_named(name) {
-            Some(t) => switch_tab_to(t.position as u32 + 1),
-            None => {
-                new_tab(Some(name), Some(dir));
-            }
+    /// Switch to the workspace's session, or start it in `dir`.
+    fn open_session(&self, name: &str, dir: &str) {
+        if self.session.as_deref() == Some(name) {
+            return;
         }
+        if self.is_live(name) {
+            switch_session(Some(name));
+        } else {
+            switch_session_with_cwd(Some(name), Some(PathBuf::from(dir)));
+        }
+    }
+
+    /// End the session of a removed workspace. The own session is left
+    /// first, for another session or else a new one in the main checkout
+    /// `main`; the dialog goes with it.
+    fn end_session(&mut self, name: &str, main: &str) {
+        if self.session.as_deref() == Some(name) {
+            self.leave_session(Some(main));
+            return;
+        }
+        if self.is_live(name) {
+            kill_sessions(&[name]);
+        }
+        close_self();
     }
 
     fn dialog_key(&mut self, key: KeyWithModifier) -> bool {
@@ -1195,22 +1435,24 @@ impl State {
                     }
                     BareKey::Enter => match prompt.choice() {
                         Choice::Existing(e) => {
-                            let tab = format!("{}{}{}", info.project(), self.separator, e.name);
-                            self.open_tab(&tab, &e.root);
+                            self.open_session(
+                                &session_name(info.project(), self.separator, &e.name),
+                                &e.root,
+                            );
                             close_self();
                             return false;
                         }
                         Choice::New(name) => {
                             let slug = slug(&name).unwrap_or_default();
                             let dir = workspace_dir(&info.main, &slug);
-                            let tab = format!("{}{}{}", info.project(), self.separator, slug);
+                            let session = session_name(info.project(), self.separator, &slug);
                             let context = BTreeMap::from([
                                 ("op".to_string(), "add".to_string()),
                                 ("dir".to_string(), dir.clone()),
-                                ("tab".to_string(), tab.clone()),
+                                ("session".to_string(), session.clone()),
                             ]);
                             run_ws(&["add", &info.vcs, &dir, &name], &info.root, context);
-                            self.dialog = Dialog::Running(format!("creating {}…", tab));
+                            self.dialog = Dialog::Running(format!("creating {}…", session));
                             return true;
                         }
                         Choice::Nothing => {}
@@ -1226,16 +1468,56 @@ impl State {
             }
             Dialog::Confirm { info } => match key.bare_key {
                 BareKey::Char('y') | BareKey::Char('Y') => {
-                    let context = BTreeMap::from([("op".to_string(), "remove".to_string())]);
+                    let session = info.session_name(self.separator);
+                    let context = BTreeMap::from([
+                        ("op".to_string(), "remove".to_string()),
+                        ("session".to_string(), session.clone()),
+                        ("main".to_string(), info.main.clone()),
+                    ]);
                     // run from the main checkout: the workspace directory is deleted
                     run_ws(&["remove", &info.vcs, &info.root, &info.name], &info.main, context);
-                    Dialog::Running(format!("removing {}…", info.tab_name(self.separator)))
+                    Dialog::Running(format!("removing {}…", session))
                 }
                 _ => {
                     close_self();
                     return false;
                 }
             },
+            Dialog::Goto(mut picker) => {
+                let ctrl = key.key_modifiers.contains(&KeyModifier::Ctrl);
+                match key.bare_key {
+                    BareKey::Esc => {
+                        close_self();
+                        return false;
+                    }
+                    BareKey::Enter => match picker.choice() {
+                        Some(Target::Session(name)) => {
+                            if self.session.as_deref() != Some(name.as_str()) {
+                                switch_session(Some(&name));
+                            }
+                            close_self();
+                            return false;
+                        }
+                        Some(Target::Project { label, path }) => {
+                            let context = BTreeMap::from([("op".to_string(), "open".to_string())]);
+                            run_ws(&["info"], &path, context);
+                            self.dialog = Dialog::Running(format!("opening {}…", label));
+                            return true;
+                        }
+                        None => {}
+                    },
+                    BareKey::Up => picker.move_selection(-1),
+                    BareKey::Down => picker.move_selection(1),
+                    BareKey::Char('p') if ctrl => picker.move_selection(-1),
+                    BareKey::Char('n') if ctrl => picker.move_selection(1),
+                    BareKey::PageUp => picker.move_selection(-10),
+                    BareKey::PageDown => picker.move_selection(10),
+                    BareKey::Backspace => picker.backspace(),
+                    BareKey::Char(c) if plain && !c.is_control() => picker.type_char(c),
+                    _ => {}
+                }
+                Dialog::Goto(picker)
+            }
             Dialog::Error(_) => {
                 close_self();
                 return false;
@@ -1245,7 +1527,7 @@ impl State {
         true
     }
 
-    fn render_dialog(&self, cols: usize) {
+    fn render_dialog(&self, rows: usize, cols: usize) {
         let text = match &self.dialog {
             Dialog::Probing => "…".to_string(),
             Dialog::Prompt { info, prompt } => {
@@ -1259,8 +1541,8 @@ impl State {
                     text.push_str("\n\u{1b}[2mexisting:\u{1b}[0m\n");
                 }
                 for (i, e) in matches.iter().enumerate() {
-                    let tab = format!("{}{}{}", info.project(), self.separator, e.name);
-                    let open = if self.tab_named(&tab).is_some() { "  \u{1b}[2m(open)\u{1b}[0m" } else { "" };
+                    let session = session_name(info.project(), self.separator, &e.name);
+                    let open = if self.is_live(&session) { "  \u{1b}[2m(open)\u{1b}[0m" } else { "" };
                     if prompt.selected == Some(i) {
                         text.push_str(&format!("\u{1b}[7m› {}\u{1b}[0m{}\n", e.name, open));
                     } else {
@@ -1274,7 +1556,7 @@ impl State {
             }
             Dialog::Confirm { info } => format!(
                 "Remove workspace {}?\n{}\n\n\u{1b}[2m{}\ny remove · any other key cancels\u{1b}[0m",
-                info.tab_name(self.separator),
+                info.session_name(self.separator),
                 info.root,
                 if info.vcs == "jj" {
                     "jj: its work stays in the repo, under a bookmark of the same name"
@@ -1282,6 +1564,7 @@ impl State {
                     "git: the branch stays; refuses if the worktree has changes"
                 }
             ),
+            Dialog::Goto(picker) => self.goto_text(picker, rows),
             Dialog::Running(msg) => msg.clone(),
             Dialog::Error(msg) => format!(
                 "\u{1b}[31m{}\u{1b}[0m\n\n\u{1b}[2many key closes\u{1b}[0m",
@@ -1295,6 +1578,42 @@ impl State {
             out.push_str("\r\n");
         }
         print!("{}", out);
+    }
+
+    /// The picker's query and the part of its matches around the selection
+    /// that fits in `rows`.
+    fn goto_text(&self, picker: &Picker, rows: usize) -> String {
+        let mut text = format!("go to: {}▏\n\n", picker.input);
+        let matches = picker.matches();
+        // query, blank, list, blank, hint, and the line break after it
+        let height = rows.saturating_sub(TOP_PAD + 5).max(1);
+        let start = (picker.selected + 1).saturating_sub(height);
+        let attention: BTreeMap<String, Option<Attention>> =
+            self.session_summaries().into_iter().collect();
+        for (i, target) in matches.iter().enumerate().skip(start).take(height) {
+            let selected = i == picker.selected;
+            let row = match target {
+                Target::Session(name) => {
+                    let dot = if self.session.as_deref() == Some(name.as_str()) { "●" } else { "▸" };
+                    let icon = self.icon(attention.get(name).copied().flatten());
+                    format!("{} {}{}", dot, icon, name)
+                }
+                Target::Project { label, .. } if selected => format!("  {}", label),
+                Target::Project { label, .. } => format!("  \u{1b}[2m{}\u{1b}[0m", label),
+            };
+            if selected {
+                text.push_str(&format!("\u{1b}[7m{}\u{1b}[0m\n", row));
+            } else {
+                text.push_str(&format!("{}\n", row));
+            }
+        }
+        if matches.is_empty() {
+            text.push_str("\u{1b}[2mno match\u{1b}[0m\n");
+        }
+        text.push_str(
+            "\n\u{1b}[2mEnter open · ↑↓ / Ctrl+n Ctrl+p pick · Esc cancel · ▸ session, dim: repository\u{1b}[0m",
+        );
+        text
     }
 }
 
@@ -1322,9 +1641,23 @@ impl ZellijPlugin for State {
             .get("close_key")
             .cloned()
             .unwrap_or_else(|| "Alt W".to_string());
+        self.goto_key = configuration
+            .get("goto_key")
+            .cloned()
+            .unwrap_or_else(|| "Alt g".to_string());
+        self.project_roots = configuration
+            .get("project_roots")
+            .cloned()
+            .unwrap_or_else(|| "~".to_string());
+        self.project_depth = configuration
+            .get("project_depth")
+            .filter(|d| d.parse::<u32>().is_ok())
+            .cloned()
+            .unwrap_or_else(|| "4".to_string());
         self.mode = match configuration.get("mode").map(String::as_str) {
             Some("new") => Mode::New,
             Some("close") => Mode::Close,
+            Some("goto") => Mode::Goto,
             _ => Mode::Sidebar,
         };
         self.plugin_id = get_plugin_ids().plugin_id;
@@ -1334,10 +1667,10 @@ impl ZellijPlugin for State {
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::SessionUpdate,
             EventType::Key,
             EventType::Mouse,
             EventType::Timer,
-            EventType::CwdChanged,
             EventType::RunCommandResult,
             EventType::PermissionRequestResult,
         ]);
@@ -1354,61 +1687,59 @@ impl ZellijPlugin for State {
         if self.mode != Mode::Sidebar {
             return self.update_dialog(event);
         }
+        // Tab and pane updates only arrive once the permissions are granted,
+        // and a session started in the background never gets a
+        // PermissionRequestResult (until a client attaches).
+        if matches!(event, Event::TabUpdate(_) | Event::PaneUpdate(_)) {
+            self.granted = true;
+        }
         match event {
             Event::PermissionRequestResult(status) => {
                 self.granted = status == PermissionStatus::Granted;
                 self.bind_keys();
-                self.probe_default_tab();
+                self.probe_session_name();
                 self.ensure_timer();
                 false
             }
             Event::ModeUpdate(mode_info) => {
-                if mode_info.session_name != self.session {
-                    self.session = mode_info.session_name;
-                    self.load_state();
+                if self.set_session_name(mode_info.session_name) {
+                    self.sync_selection();
                     return true;
                 }
                 false
             }
+            Event::SessionUpdate(sessions, _) => self.on_sessions(sessions),
             Event::TabUpdate(tabs) => {
                 self.tabs = tabs;
-                // Pick up order/collapse changes written by other instances —
-                // every tab switch fires a TabUpdate, so the visible sidebar
-                // is always freshly synced.
                 self.load_state();
                 // Clear on focus: the active tab is "seen", so strip its marker.
                 // Safe on every TabUpdate because set_attention never marks the
-                // active tab, so there's no marker here to race with.
-                if let Some(pos) = self.tabs.iter().find(|t| t.active).map(|t| t.position) {
-                    self.clear_tab(pos);
-                }
-                // An agent still waiting for input is marked again by the next
-                // title read once you leave its tab without answering.
-                if let Some(i) = self.active_row_index() {
-                    self.selected = i;
-                } else {
-                    let len = self.build_rows().len();
-                    if len > 0 && self.selected >= len {
-                        self.selected = len - 1;
-                    }
-                }
+                // active tab of an attached session, so there's no marker here
+                // to race with. An agent still waiting for input is marked again
+                // by the next title read once you leave its tab without answering.
+                self.clear_seen_tab();
+                self.sync_selection();
                 self.ensure_timer();
-                self.probe_default_tab();
                 true
             }
             Event::Timer(_) => {
                 self.timer_running = false;
+                if self.leave_tick() {
+                    return false;
+                }
                 self.since_poll += self.timer_interval;
+                let mut changed = false;
                 if self.since_poll >= POLL_INTERVAL {
                     self.since_poll = 0.0;
                     self.poll_agents();
+                    changed = self.refresh_sessions();
                 }
                 let working = self.any_working();
                 if working {
                     self.spin = self.spin.wrapping_add(1);
                 }
                 self.ensure_timer();
-                working
+                working || changed
             }
             Event::PaneUpdate(manifest) => {
                 self.update_panes(&manifest);
@@ -1421,29 +1752,15 @@ impl ZellijPlugin for State {
                     .collect();
                 self.track_agents(titles);
                 self.bind_keys();
-                self.probe_default_tab();
+                self.probe_session_name();
                 self.close_if_empty();
-                false
-            }
-            // Every sidebar instance gets every cwd change; only the one in
-            // the pane's own tab acts on it.
-            Event::CwdChanged(PaneId::Terminal(pane_id), cwd, _) => {
-                if self.granted
-                    && self.own_tab.is_some()
-                    && self.pane_tab.get(&pane_id) == self.own_tab.as_ref()
-                {
-                    self.probe_name(pane_id, &cwd);
-                }
                 false
             }
             Event::RunCommandResult(Some(0), stdout, _, context)
                 if context.get("op").map(String::as_str) == Some("name") =>
             {
-                let pane = context.get("pane").and_then(|p| p.parse::<u32>().ok());
-                if let (Some(pane), Some(info)) =
-                    (pane, parse_info(&String::from_utf8_lossy(&stdout)))
-                {
-                    self.rename_for_workspace(pane, &info);
+                if let Some(info) = parse_info(&String::from_utf8_lossy(&stdout)) {
+                    self.rename_after_workspace(&info);
                 }
                 false
             }
@@ -1474,9 +1791,9 @@ impl ZellijPlugin for State {
         false
     }
 
-    fn render(&mut self, _rows: usize, cols: usize) {
+    fn render(&mut self, rows: usize, cols: usize) {
         if self.mode != Mode::Sidebar {
-            self.render_dialog(cols);
+            self.render_dialog(rows, cols);
             return;
         }
         let visible = self.build_rows();
@@ -1486,7 +1803,7 @@ impl ZellijPlugin for State {
             out.push_str("\r\n");
         }
         if visible.is_empty() {
-            out.push_str(&format!("{}\u{1b}[2m(no tabs)\u{1b}[0m", pad));
+            out.push_str(&format!("{}\u{1b}[2m(no sessions)\u{1b}[0m", pad));
             print!("{}", out);
             return;
         }
@@ -1505,10 +1822,10 @@ impl ZellijPlugin for State {
                         format!("{} {}{} ({})", disc, icon, name, count)
                     }
                 }
-                Row::Tab { position, label, active, attention } => {
-                    let dot = if *active { "●" } else { " " };
+                Row::Session { session, label, current, attention } => {
+                    let dot = if *current { "●" } else { " " };
                     let editing = match &self.renaming {
-                        Some((RenameTarget::Tab(p), buf)) if p == position => Some(buf),
+                        Some((RenameTarget::Session(s), buf)) if s == session => Some(buf),
                         _ => None,
                     };
                     if let Some(buf) = editing {
@@ -1636,7 +1953,7 @@ mod tests {
         let p = Persisted {
             order: vec!["work".to_string(), "General".to_string()],
             collapsed: ["scratch".to_string()].into(),
-            tab_order: [(
+            session_order: [(
                 "work".to_string(),
                 vec!["db".to_string(), "api".to_string()],
             )]
@@ -1649,18 +1966,17 @@ mod tests {
 
     #[test]
     fn sort_by_saved_orders_known_labels_then_native() {
-        let item = |label: &str, position: usize| TabItem {
-            position,
+        let item = |label: &str| Item {
+            session: format!("p:{}", label),
             label: label.to_string(),
-            active: false,
+            current: false,
             attention: None,
         };
-        let mut items = vec![item("a", 0), item("b", 1), item("c", 2), item("b", 3)];
+        let mut items = vec![item("a"), item("b"), item("c"), item("d")];
         sort_by_saved(&mut items, &["c".to_string(), "b".to_string()]);
-        let got: Vec<(usize, &str)> =
-            items.iter().map(|it| (it.position, it.label.as_str())).collect();
-        // saved first (c, then both b's in stable native order), unseen (a) after
-        assert_eq!(got, vec![(2, "c"), (1, "b"), (3, "b"), (0, "a")]);
+        let got: Vec<&str> = items.iter().map(|it| it.label.as_str()).collect();
+        // saved first, unseen (a, d) after in their native order
+        assert_eq!(got, vec!["c", "b", "a", "d"]);
     }
 
     #[test]
@@ -1684,12 +2000,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_tab_closes_or_quits_only_after_its_panes_are_gone() {
+    fn empty_tab_closes_or_leaves_only_after_its_panes_are_gone() {
         // a fresh tab may list only the sidebar before its terminal exists
         assert_eq!(empty_tab_action(false, 0, 3), None);
         assert_eq!(empty_tab_action(true, 1, 3), None);
         assert_eq!(empty_tab_action(true, 0, 3), Some(EmptyTab::Close));
-        assert_eq!(empty_tab_action(true, 0, 1), Some(EmptyTab::Quit));
+        assert_eq!(empty_tab_action(true, 0, 1), Some(EmptyTab::Leave));
     }
 
     #[test]
@@ -1721,12 +2037,30 @@ mod tests {
     }
 
     #[test]
-    fn default_tab_names_detected() {
-        assert!(is_default_tab_name("Tab #1"));
-        assert!(is_default_tab_name("Tab #42"));
-        assert!(!is_default_tab_name("Tab #"));
-        assert!(!is_default_tab_name("Tab #1x"));
-        assert!(!is_default_tab_name("work:api"));
+    fn generated_session_names_detected() {
+        assert!(is_generated_session_name("gregarious-cactus"));
+        assert!(!is_generated_session_name("proj:main"));
+        assert!(!is_generated_session_name("work"));
+        assert!(!is_generated_session_name("my-fancy-session"));
+        assert!(!is_generated_session_name("Big-Cat"));
+        assert!(!is_generated_session_name("-cactus"));
+    }
+
+    #[test]
+    fn leaving_prefers_another_session_of_the_same_project() {
+        let live = |name: &str| SessionInfo { name: name.to_string(), ..Default::default() };
+        let mut s = State {
+            separator: ':',
+            session: Some("proj:feat".to_string()),
+            sessions: vec![live("aaa:main"), live("proj:feat"), live("proj:main")],
+            ..Default::default()
+        };
+        assert_eq!(s.fallback_session("proj:feat").as_deref(), Some("proj:main"));
+        // no other session of the project: the first one in sidebar order
+        s.sessions.retain(|x| x.name != "proj:main");
+        assert_eq!(s.fallback_session("proj:feat").as_deref(), Some("aaa:main"));
+        s.sessions.retain(|x| x.name == "proj:feat");
+        assert_eq!(s.fallback_session("proj:feat"), None);
     }
 
     #[test]
@@ -1742,14 +2076,14 @@ mod tests {
         let mut s = State {
             group_order: vec!["work".to_string(), "misc".to_string()],
             collapsed: ["work".to_string()].into(),
-            tab_order: [("work".to_string(), vec!["api".to_string()])].into(),
+            session_order: [("work".to_string(), vec!["api".to_string()])].into(),
             ..Default::default()
         };
         s.migrate_group_state("work", "proj");
         assert_eq!(s.group_order, vec!["proj", "misc"]);
         assert!(s.collapsed.contains("proj") && !s.collapsed.contains("work"));
-        assert_eq!(s.tab_order.get("proj"), Some(&vec!["api".to_string()]));
-        assert!(!s.tab_order.contains_key("work"));
+        assert_eq!(s.session_order.get("proj"), Some(&vec!["api".to_string()]));
+        assert!(!s.session_order.contains_key("work"));
         // renaming into an existing group must not duplicate it in the order
         s.migrate_group_state("proj", "misc");
         assert_eq!(s.group_order, vec!["misc"]);

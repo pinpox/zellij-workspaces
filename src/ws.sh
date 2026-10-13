@@ -5,10 +5,12 @@
 # zellij rewrites a command cwd under /tmp, /data, /cache or /host to plugin
 # sandbox directories, arguments are passed through untouched.
 #
-#   info              print "<vcs>\t<main root>\t<workspace root>\t<workspace name>"
-#                     for DIR; exit 3 when DIR is not in a jj or git repository
-#   list              print "<name>\t<root>" for each workspace/worktree of the
-#                     repository except the main checkout, if its directory exists
+#   info              print "<vcs>\t<main root>\t<workspace root>\t<workspace name>
+#                     \t<project name>" for DIR (see project_name); exit 3 when DIR
+#                     is not in a jj or git repository
+#   list [all]        print "<name>\t<root>" for each workspace/worktree of the
+#                     repository if its directory exists; the main checkout
+#                     only with `all` (named as by `info`)
 #   add VCS PATH NAME create workspace/worktree NAME at PATH (git: branch NAME;
 #                     jj: on top of bookmark NAME if it exists); succeeds without
 #                     changes if PATH already is that workspace of this
@@ -23,7 +25,39 @@
 #                     cannot move a workspace), a bookmark OLD marking only this
 #                     workspace's work is renamed along; git: the worktree moves
 #                     next to ROOT, its branch is renamed if it is OLD
+#   projects DEPTH ROOT...
+#                     print "<path below ROOT>\t<path>" for each jj or git
+#                     repository at most DEPTH directories below a ROOT (`~`
+#                     is expanded), skipping hidden directories, workspaces in
+#                     `*.ws` directories and repositories inside repositories
 set -eu
+
+# Project name of main checkout $1: its directory name, or for a second
+# repository with that name, the name prefixed with its parent directories'
+# names until it is unique ("owner-repo"). Names are kept in a registry the
+# first time a repository is seen, so they never change afterwards.
+project_name() {
+  reg=${XDG_STATE_HOME:-$HOME/.local/state}/zellij-workspaces/projects
+  name=$(awk -F '\t' -v r="$1" '$2 == r { print $1; exit }' "$reg" 2>/dev/null || true)
+  if [ -z "$name" ]; then
+    taken() { awk -F '\t' -v n="$1" '$1 == n { f = 1 } END { exit !f }' "$reg" 2>/dev/null; }
+    name=$(basename "$1")
+    parent=$(dirname "$1")
+    n=1
+    while taken "$name"; do
+      if [ "$parent" != / ]; then
+        name=$(basename "$parent")-$name
+        parent=$(dirname "$parent")
+      else
+        n=$((n + 1))
+        name=$(basename "$1")-$n
+      fi
+    done
+    mkdir -p "$(dirname "$reg")"
+    printf '%s\t%s\n' "$name" "$1" >>"$reg"
+  fi
+  printf %s "$name"
+}
 
 info() {
   if root=$(jj workspace root --ignore-working-copy 2>/dev/null); then
@@ -40,11 +74,11 @@ info() {
     fi
     name=$(jj workspace list --ignore-working-copy -T 'name ++ "\t" ++ root ++ "\n"' |
       awk -F '\t' -v r="$root" '$2 == r { print $1; exit }')
-    printf 'jj\t%s\t%s\t%s\n' "$main" "$root" "${name:-default}"
+    printf 'jj\t%s\t%s\t%s\t%s\n' "$main" "$root" "${name:-default}" "$(project_name "$main")"
   elif root=$(git rev-parse --show-toplevel 2>/dev/null); then
     main=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
     if [ "$root" = "$main" ]; then name=main; else name=$(basename "$root"); fi
-    printf 'git\t%s\t%s\t%s\n' "$main" "$root" "$name"
+    printf 'git\t%s\t%s\t%s\t%s\n' "$main" "$root" "$name" "$(project_name "$main")"
   else
     return 3
   fi
@@ -62,15 +96,42 @@ case $cmd in
 info)
   info
   ;;
+projects)
+  depth=$1
+  shift
+  for root in "$@"; do
+    case $root in
+    "~") root=$HOME ;;
+    "~/"*) root=$HOME/${root#"~/"} ;;
+    esac
+    root=${root%/}
+    [ -d "$root" ] || continue
+    find "$root" -mindepth 1 -maxdepth $((depth + 1)) \
+      \( -type d -name '*.ws' -prune \) -o \
+      \( -type d \( -name .git -o -name .jj \) -print -prune \) -o \
+      \( -type d -name '.*' -prune \) 2>/dev/null |
+      sed 's|/[^/]*$||' | LC_ALL=C sort -u |
+      awk -v r="$root/" '
+        { for (k in kept) if (index($0, k "/") == 1) next
+          kept[$0] = 1
+          print (index($0, r) == 1 ? substr($0, length(r) + 1) : $0) "\t" $0 }'
+  done
+  ;;
 list)
   main=$(info | cut -f2)
-  if [ "$(info | cut -f1)" = jj ]; then
+  vcs=$(info | cut -f1)
+  all=${1:-}
+  if [ "$vcs" = jj ]; then
     jj workspace list --ignore-working-copy -T 'name ++ "\t" ++ root ++ "\n"'
   else
     git worktree list --porcelain | sed -n 's/^worktree //p' |
       while IFS= read -r root; do printf '%s\t%s\n' "$(basename "$root")" "$root"; done
   fi | while IFS="$(printf '\t')" read -r name root; do
-    if [ -n "$root" ] && [ "$root" != "$main" ] && [ -d "$root" ]; then
+    if [ "$root" = "$main" ]; then
+      [ "$all" = all ] || continue
+      [ "$vcs" = jj ] || name=main
+    fi
+    if [ -n "$root" ] && [ -d "$root" ]; then
       printf '%s\t%s\n' "$name" "$root"
     fi
   done
@@ -78,7 +139,7 @@ list)
 add)
   vcs=$1 dir=$2 name=$3
   if [ -e "$dir" ]; then
-    # reopening a workspace whose tab was closed
+    # reopening a workspace whose session was ended
     here=$(info | cut -f2)
     if there=$(cd "$dir" && info) &&
       [ "$(echo "$there" | cut -f2)" = "$here" ] &&

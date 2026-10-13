@@ -1,6 +1,6 @@
 #!/bin/sh
 # Create, rename and remove jj workspaces / git worktrees from the command line,
-# each in its own zellij tab, the way the sidebar's Alt w / Alt W dialogs do.
+# each in its own zellij session, the way the sidebar's Alt w / Alt W dialogs do.
 # Meant for scripts and coding agents; the VCS work is the plugin's own ws.sh.
 #
 # @wsSh@ and @jq@ are filled in by the Nix build.
@@ -8,7 +8,7 @@ set -eu
 
 ws_sh=@wsSh@
 jq=@jq@
-# the plugin's default `separator`: tabs are named project:workspace
+# the plugin's default `separator`: sessions are named project:workspace
 sep=:
 ht=$(printf '\t')
 
@@ -19,18 +19,18 @@ Usage: zellij-ws COMMAND [ARGS]    (run inside a jj or git repository)
   list                      workspaces of the repository except the main checkout,
                             one "<name><TAB><root>" line each
   status [NAME]             "<name><TAB><state><TAB><root>" for each workspace (or just
-                            NAME); state: working, needs-input, done (finished, tab not
-                            looked at since), open (tab open, nothing to report) or
-                            closed (no tab). Needs zellij
+                            NAME); state: working, needs-input, done (finished, not
+                            looked at since), open (session running, nothing to report)
+                            or closed (no session). Needs zellij
   new NAME [-- COMMAND...]  create workspace NAME next to the main checkout, or reopen
-                            an existing one, and open it in a background tab running
-                            COMMAND (default: a shell); prints the workspace root
-  rename [OLD] NEW          rename workspace OLD (default: the current one) and its tab;
-                            prints the workspace root
-  close NAME                remove workspace NAME and close its tab; jj keeps its work
+                            an existing one, and start its session in the background
+                            running COMMAND (default: a shell); prints the workspace root
+  rename [OLD] NEW          rename workspace OLD (default: the current one) and its
+                            session; prints the workspace root
+  close NAME                remove workspace NAME and end its session; jj keeps its work
                             under bookmark NAME, git refuses if the worktree is dirty
 
-Tabs are opened, renamed and closed only inside zellij ($ZELLIJ set).
+Sessions are started, renamed and ended only inside zellij ($ZELLIJ set).
 EOF
 }
 
@@ -47,6 +47,11 @@ in_zellij() {
   [ -n "${ZELLIJ:-}" ]
 }
 
+# session name of workspace $1, like the plugin's (session names cannot contain /)
+session_of() {
+  printf %s "$project$sep$1" | tr / -
+}
+
 # workspace directory name for a requested name, like the plugin's dialog
 slug() {
   s=$(printf %s "$1" | tr / -)
@@ -61,12 +66,16 @@ root_of() {
   ws "$root" list | awk -F '\t' -v n="$1" '$1 == n { print $2; exit }'
 }
 
-# "<tab id><TAB><tab name>" of the tab named $1, ignoring the agent status
-# marker the plugin appends; empty if there is none
-find_tab() {
-  zellij action list-tabs --json | "$jq" -r --arg n "$1" '
-    map(select((.name | sub(" (⏳|✅|⚙)$"; "")) == $n))
-    | first | select(.) | "\(.tab_id)\t\(.name)"'
+# tabs of session $1 as JSON
+session_tabs() {
+  zellij -s "$1" action list-tabs --json
+}
+
+# whether session $1 is running (inside zellij, `zellij -s` with an unknown
+# session succeeds after printing the session list)
+is_live() {
+  zellij list-sessions --no-formatting 2>/dev/null |
+    awk -v p="$1 [Created " 'index($0, p) == 1 && !/\(EXITED/ { found = 1 } END { exit !found }'
 }
 
 [ $# -ge 1 ] || {
@@ -83,10 +92,9 @@ case $cmd in
 esac
 
 info=$(ws "$PWD" info) || die "not in a jj or git repository: $PWD"
-IFS=$ht read -r vcs main root current <<EOF
+IFS=$ht read -r vcs main root current project <<EOF
 $info
 EOF
-project=$(basename "$main")
 
 case $cmd in
 list)
@@ -99,17 +107,21 @@ status)
   in_zellij || die "status needs zellij"
   only=
   [ $# -eq 0 ] || only=$(slug "$1")
-  tabs=$(zellij action list-tabs --json)
   out=$(ws "$root" list | while IFS=$ht read -r name dir; do
     [ -z "$only" ] || [ "$name" = "$only" ] || continue
-    # the sidebar keeps an agent's state as a marker on its tab name
-    state=$(printf %s "$tabs" | "$jq" -r --arg n "$project$sep$name" '
-      map(.name | select(sub(" (⏳|✅|⚙)$"; "") == $n)) | first
-      | if . == null then "closed"
-        elif endswith(" ⏳") then "needs-input"
-        elif endswith(" ⚙") then "working"
-        elif endswith(" ✅") then "done"
-        else "open" end')
+    # the sidebar keeps an agent's state as a marker on its tab's name; the
+    # session reports its most urgent one
+    session=$(session_of "$name")
+    if is_live "$session"; then
+      state=$(session_tabs "$session" | "$jq" -r '
+        map(.name) as $n
+        | if any($n[]; endswith(" ⏳")) then "needs-input"
+          elif any($n[]; endswith(" ⚙")) then "working"
+          elif any($n[]; endswith(" ✅")) then "done"
+          else "open" end')
+    else
+      state=closed
+    fi
     printf '%s\t%s\t%s\n' "$name" "$state" "$dir"
   done)
   [ -z "$only" ] || [ -n "$out" ] || die "no workspace $only in $project"
@@ -127,25 +139,25 @@ new)
     in_zellij || die "running a COMMAND needs zellij"
   fi
   s=$(slug "$name")
+  session=$(session_of "$s")
   open=
-  if in_zellij; then
-    open=$(find_tab "$project$sep$s")
-    if [ -n "$open" ] && [ $# -gt 0 ]; then
-      die "workspace $s is already open in tab $project$sep$s, not starting $1 in it"
-    fi
+  if in_zellij && is_live "$session"; then
+    open=1
+    [ $# -eq 0 ] || die "workspace $s is already open in session $session, not starting $1 in it"
   fi
   dir=$(root_of "$s")
   if [ -z "$dir" ]; then
-    dir=$(dirname "$main")/$project.ws/$s
+    dir=$main.ws/$s
     ws "$root" add "$vcs" "$dir" "$name" >&2
   fi
   if in_zellij; then
     if [ -n "$open" ]; then
-      echo "zellij-ws: $project$sep$s is already open" >&2
+      echo "zellij-ws: $session is already open" >&2
     elif [ $# -gt 0 ]; then
-      zellij action new-tab --no-focus --cwd "$dir" --name "$project$sep$s" -- "$@" >/dev/null
+      # a new session starts in the directory it is created from
+      (cd "$dir" && zellij attach --create-background "$session" -- "$@") >/dev/null
     else
-      zellij action new-tab --no-focus --cwd "$dir" --name "$project$sep$s" >/dev/null
+      (cd "$dir" && zellij attach --create-background "$session") >/dev/null
     fi
   fi
   printf '%s\n' "$dir"
@@ -172,13 +184,8 @@ rename)
   [ -z "$(root_of "$s")" ] || die "workspace $s already exists in $project"
   # run from the main checkout: a git worktree moves away under its own cwd
   dir=$(ws "$main" rename "$vcs" "$dir" "$old" "$new")
-  if in_zellij; then
-    open=$(find_tab "$project$sep$old")
-    if [ -n "$open" ]; then
-      full=${open#*"$ht"}
-      marker=${full#"$project$sep$old"}
-      zellij action rename-tab-by-id "${open%%"$ht"*}" "$project$sep$s$marker"
-    fi
+  if in_zellij && is_live "$(session_of "$old")"; then
+    zellij -s "$(session_of "$old")" action rename-session "$(session_of "$s")"
   fi
   printf '%s\n' "$dir"
   ;;
@@ -191,13 +198,13 @@ close)
   case "$(pwd -P)/" in
   "$dir"/*) die "$PWD is inside workspace $s; close it from another workspace" ;;
   esac
+  session=$(session_of "$s")
+  [ "${ZELLIJ_SESSION_NAME:-}" != "$session" ] ||
+    die "this shell runs in session $session; close it from another session"
   # run from the main checkout: the workspace directory is deleted
   ws "$main" remove "$vcs" "$dir" "$s" >&2
-  if in_zellij; then
-    open=$(find_tab "$project$sep$s")
-    if [ -n "$open" ]; then
-      zellij action close-tab-by-id "${open%%"$ht"*}"
-    fi
+  if in_zellij && is_live "$session"; then
+    zellij kill-session "$session" >/dev/null
   fi
   ;;
 

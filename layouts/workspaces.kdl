@@ -1,14 +1,21 @@
-// workspaces.kdl: zellij-workspaces sidebar + default status bar
+// workspaces.kdl: tab bar on top, zellij-workspaces sidebar, default status bar
 // Usage: zellij --layout workspaces  (or `default_layout "workspaces"` in config.kdl)
-// New tabs copy this layout, so every tab gets the sidebar.
+// New tabs copy this layout, so every tab gets the tab bar and the sidebar.
 
 layout {
+    // the tabs of the current session, i.e. of the current workspace
+    pane size=1 borderless=true {
+        plugin location="zellij:tab-bar"
+    }
     pane split_direction="vertical" {
         pane size=28 borderless=true {
             plugin location="file:~/.config/zellij/plugins/zellij-workspaces.wasm" {
-                // new_key "Alt w"    // create a workspace for the focused pane's repo ("" disables)
-                // close_key "Alt W"  // remove the focused tab's workspace ("" disables)
-                // separator ":"      // tab names are project<separator>workspace
+                // new_key "Alt w"    // open or create a workspace of the focused pane's repo ("" disables)
+                // close_key "Alt W"  // remove the focused pane's workspace ("" disables)
+                // goto_key "Alt g"   // fuzzy-find a session or repository to open ("" disables)
+                // project_roots "~"  // where Alt g looks for repositories, ":"-separated
+                // project_depth "4"  // how deep below a root a repository may be
+                // separator ":"      // session names are project<separator>workspace
             }
         }
         pane // main terminal area

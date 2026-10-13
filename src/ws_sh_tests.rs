@@ -29,6 +29,7 @@ impl Sandbox {
         let mut c = Command::new(program);
         c.current_dir(cwd)
             .env("HOME", self.dir.join("home"))
+            .env_remove("XDG_STATE_HOME")
             .env("JJ_CONFIG", self.dir.join("jj.toml"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_AUTHOR_NAME", "t")
@@ -54,11 +55,13 @@ impl Sandbox {
             .unwrap()
     }
 
+    /// `info`'s fields up to the workspace name (the project name has its
+    /// own test).
     fn info(&self, cwd: &Path) -> Vec<String> {
         let out = self.ws(&["info"], cwd);
         assert!(out.status.success(), "info: {}", stderr(&out));
         let line = String::from_utf8(out.stdout).unwrap();
-        line.trim_end().split('\t').map(String::from).collect()
+        line.trim_end().split('\t').take(4).map(String::from).collect()
     }
 }
 
@@ -192,6 +195,19 @@ fn list_shows_other_workspaces_on_disk() {
             "{}: main checkout excluded, from any workspace",
             vcs
         );
+        // `all` adds the main checkout, named as `info` names it
+        let out = sb.ws(&["list", "all"], &b);
+        let mut lines: Vec<String> =
+            String::from_utf8_lossy(&out.stdout).lines().map(String::from).collect();
+        lines.sort();
+        let main_name = if vcs == "jj" { "default" } else { "main" };
+        let mut want = vec![
+            format!("a\t{}", s(&a)),
+            format!("b\t{}", s(&b)),
+            format!("{}\t{}", main_name, s(m)),
+        ];
+        want.sort();
+        assert_eq!(lines, want, "{}: list all", vcs);
     }
 }
 
@@ -333,4 +349,59 @@ fn info_outside_a_repository_exits_3() {
     let out = sb.ws(&["info"], &sb.dir);
     assert_eq!(out.status.code(), Some(3));
     assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn projects_finds_repositories_below_the_roots() {
+    let sb = Sandbox::new("projects");
+    let home = sb.dir.join("home");
+    let code = home.join("code");
+    for d in ["host/a", "b", "deep/x/y/z", ".hidden/r", "host/a.ws/feat", "notes"] {
+        fs::create_dir_all(code.join(d)).unwrap();
+    }
+    sb.run("git", &["init", "-q", "."], &code.join("host/a"));
+    sb.run("jj", &["git", "init", "b"], &code);
+    // inside a repository, hidden, a workspace, too deep: all skipped
+    sb.run("git", &["init", "-q", "nested"], &code.join("host/a"));
+    sb.run("git", &["init", "-q", "."], &code.join(".hidden/r"));
+    sb.run("jj", &["git", "init", "."], &code.join("host/a.ws/feat"));
+    sb.run("git", &["init", "-q", "."], &code.join("deep/x/y/z"));
+
+    let out = sb.ws(&["projects", "3", "~/code", "/does/not/exist"], Path::new("/"));
+    assert!(out.status.success(), "projects: {}", stderr(&out));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("b\t{}\nhost/a\t{}\n", s(&code.join("b")), s(&code.join("host/a")))
+    );
+}
+
+#[test]
+fn project_names_are_unique_and_stable() {
+    let sb = Sandbox::new("project-names");
+    let project = |dir: &Path| {
+        let out = sb.ws(&["info"], dir);
+        assert!(out.status.success(), "info: {}", stderr(&out));
+        String::from_utf8(out.stdout).unwrap().trim_end().rsplit('\t').next().unwrap().to_string()
+    };
+    let mut repos = Vec::new();
+    for owner in ["alice", "bob", "carol"] {
+        fs::create_dir_all(sb.dir.join("code").join(owner)).unwrap();
+        sb.run("git", &["init", "-q", "nixos"], &sb.dir.join("code").join(owner));
+        repos.push(sb.dir.join("code").join(owner).join("nixos"));
+    }
+    let bob = sb.dir.join("code/bob/nixos");
+    fs::create_dir_all(bob.join("sub")).unwrap();
+    // the first repository seen keeps the plain name, from any subdirectory
+    assert_eq!(project(&bob.join("sub")), "nixos");
+    assert_eq!(project(&repos[0]), "alice-nixos");
+    assert_eq!(project(&repos[2]), "carol-nixos");
+    // and it sticks, whatever is seen in between
+    assert_eq!(project(&bob), "nixos");
+    assert_eq!(project(&repos[0]), "alice-nixos");
+
+    // a git worktree belongs to its main checkout's project
+    let wt = sb.dir.join("code/alice/nixos.ws/feat");
+    sb.run("git", &["commit", "-q", "--allow-empty", "-m", "init"], &repos[0]);
+    assert!(sb.ws(&["add", "git", &s(&wt), "feat"], &repos[0]).status.success());
+    assert_eq!(project(&wt), "alice-nixos");
 }

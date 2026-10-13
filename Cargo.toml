@@ -2,7 +2,7 @@
 name = "zellij-workspaces"
 version = "0.3.0"
 edition = "2021"
-description = "Zellij sidebar: tabs grouped by project, with jj workspace / git worktree management"
+description = "Zellij sidebar: one session per jj workspace / git worktree, grouped by project"
 license = "MIT"
 
 [dependencies]

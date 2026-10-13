@@ -1,5 +1,5 @@
 {
-  description = "Zellij sidebar plugin: tabs grouped by project, with jj/git workspace management";
+  description = "Zellij sidebar plugin: one session per jj/git workspace, grouped by project";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
